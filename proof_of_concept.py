@@ -51,16 +51,66 @@ clad.region = clad_region
 
 pitch = 1.26
 
-# Set vacuum boundary condition (an incident flux source will be added later)
-box = openmc.model.rectangular_prism(width=pitch, height=pitch,
-                               boundary_type='vacuum')
-water_region = box & +clad_or
+left   = openmc.XPlane(x0=-pitch/2)
+right  = openmc.XPlane(x0=pitch/2)
+bottom = openmc.YPlane(y0=-pitch/2)
+top    = openmc.YPlane(y0=pitch/2)
 
+water_region = +left & -right & +bottom & -top & +clad_or
+
+# Define the moderator
 moderator = openmc.Cell(4, 'moderator')
 moderator.fill = water
 moderator.region = water_region
 
-root = openmc.Universe(cells=(fuel, gap, clad, moderator))
+# --------------
+# Tally Regions
+# --------------
+box = openmc.model.rectangular_prism(width=3/2*pitch, height=3/2*pitch,
+                               boundary_type='vacuum')
+
+# Define artificial (vacuum) regions for tallying angular flux
+vacuum_region       = box & ~water_region
+right_tally_region  = box & +right  & -top  & +bottom
+left_tally_region   = box & -left   & -top  & +bottom
+top_tally_region    = box & +top    & +left & -right
+bottom_tally_region = box & -bottom & +left & -right
+
+# Define junk regions which are nonetheless neessary for fully defining the geometry
+top_right    = box & +right & +top
+top_left     = box & -left  & +top
+bottom_right = box & +right & -bottom
+bottom_left  = box & -left  & -bottom
+
+# ------------
+# Tally Cells
+# ------------
+# Tallies
+right_tally_cell = openmc.Cell(11, 'right_tally')
+right_tally_cell.region = right_tally_region
+
+left_tally_cell = openmc.Cell(12, 'left_tally')
+left_tally_cell.region = left_tally_region
+
+top_tally_cell = openmc.Cell(13, 'top_tally')
+top_tally_cell.region = top_tally_region
+
+bottom_tally_cell = openmc.Cell(14, 'bottom_tally')
+bottom_tally_cell.region = bottom_tally_region
+
+# Junk cells
+top_right_cell           = openmc.Cell(15, 'top_right')
+top_right_cell.region    = top_right
+top_left_cell            = openmc.Cell(16, 'top_left')
+top_left_cell.region     = top_left
+bottom_left_cell         = openmc.Cell(17, 'bottom_left')
+bottom_left_cell.region  = bottom_left
+bottom_right_cell        = openmc.Cell(18, 'bottom_right')
+bottom_right_cell.region = bottom_right
+
+root = openmc.Universe(cells=(fuel, gap, clad, moderator, 
+                              right_tally_cell, left_tally_cell, top_tally_cell, bottom_tally_cell, 
+                              top_right_cell, top_left_cell, bottom_left_cell, bottom_right_cell))
 
 geom = openmc.Geometry()
 geom.root_universe = root
@@ -72,7 +122,11 @@ plt.savefig('geometry.png', dpi=500)
 #==========
 # Settings
 #==========
-# Define incident flux source
+
+# ---------------------
+# Incident Flux Source
+# ---------------------
+# Currently defining via openmc stats distributions, but will be supplied by a file in the final version
 boundary_offset = 1e-4  # Slight inward shift to avoid exact boundaries
 
 # Adjust px, mx, py, my distributions
@@ -101,7 +155,9 @@ src_mx = openmc.Source(space=spatial_distmx, angle=angle_distpx, energy=energy_d
 src_py = openmc.Source(space=spatial_distpy, angle=angle_distmy, energy=energy_dist)
 src_my = openmc.Source(space=spatial_distmy, angle=angle_distpy, energy=energy_dist)
 
-
+# ------------------
+# Particle Settings
+# ------------------
 settings = openmc.Settings()
 settings.source = [src_px, src_mx, src_py, src_my]
 # point = openmc.stats.Point((0.0, 0.0, 0.0))
@@ -112,34 +168,22 @@ settings.particles = 10000
 settings.run_mode = 'fixed source'
 settings.export_to_xml()
 
-# ==========
+# ========
 # Tallies
-# ==========
+# ========
 tallies = openmc.Tallies()
 
-# Create a mesh for tallying
-mesh = openmc.RegularMesh()
-N = 15
-mesh.dimension = [N, N, 1]  # 100x100 mesh in XY plane, 1 bin in Z
-mesh.lower_left = [-pitch / 2, -pitch / 2, -1e-5]
-mesh.upper_right = [pitch / 2, pitch / 2, 1e-5]
+right_filter = openmc.CellFilter([right_tally_cell.id])
+left_filter = openmc.CellFilter([left_tally_cell.id])
+top_filter = openmc.CellFilter([top_tally_cell.id])
+bottom_filter = openmc.CellFilter([bottom_tally_cell.id])
 
-# Create a mesh filter
-mesh_filter = openmc.MeshFilter(mesh)
-
-# Flux tally
-flux_tally = openmc.Tally(name='flux')
-flux_tally.filters = [mesh_filter]
-flux_tally.scores = ['flux']
-tallies.append(flux_tally)
-
-# Fission density tally
-fission_tally = openmc.Tally(name='fission')
-fission_tally.filters = [mesh_filter]
-fission_tally.scores = ['fission']
-tallies.append(fission_tally)
+rightflux_tally = openmc.Tally(name = 'flux_at_right_boundary')
+rightflux_tally.filters = [right_filter]
+rightflux_tally.scores = ['flux']
 
 # Export tallies to XML
+tallies.append(rightflux_tally)
 tallies.export_to_xml()
 
 
