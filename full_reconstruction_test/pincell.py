@@ -205,11 +205,12 @@ bottom_filter = openmc.CellFilter([bottom_tally_cell.id])
 # -----------------------------
 # Legendre polynomial expansion filter
 order = 6
-expand_filter = openmc.SpatialLegendreFilter(order, 'y', -pitch/2, pitch/2)
+spatial_expand_filter = openmc.SpatialLegendreFilter(order, 'y', -pitch/2, pitch/2)
+angle_expand_filter = openmc.LegendreFilter(order)
 
 # Define a 1D mesh along the y-direction
 mesh = openmc.Mesh()
-Ny = 20
+Ny = 30
 mesh.dimension = [1, Ny]  # 1 bin in x, 20 bins in y
 mesh.lower_left = [pitch/2, -pitch/2]  # Narrow region near the right boundary
 mesh.upper_right = [3/4*pitch, pitch/2]  # Extend over the y range
@@ -218,13 +219,14 @@ mesh_filter = openmc.MeshFilter(mesh)
 # Energy filter for multigroup energy binning
 # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 # Read in CASMO 70 group structure from h5
-with h5py.File('cas25.h5', 'r') as f:
+with h5py.File('cas8.h5', 'r') as f:
     energy_groups = f['energy groups'][:]
 
-energy_filter = openmc.EnergyFilter(np.linspace(1E-05, 10E+06, 5))
+energy_filter = openmc.EnergyFilter(energy_groups)
+# energy_filter = openmc.EnergyFilter(np.linspace(1E-05, 10E+06, 5))
 
 # Angular filter for positive x direction binning
-Nω = 10
+Nω = 20
 px_angle_filter = openmc.AzimuthalFilter(np.linspace(-np.pi/2, np.pi/2, Nω+1))
 
 rightflux_tally = openmc.Tally(name = 'flux_at_right_boundary')
@@ -232,7 +234,7 @@ rightflux_tally.filters = [right_filter, mesh_filter, px_angle_filter, energy_fi
 rightflux_tally.scores = ['flux']
 
 rightflux_tally_moment = openmc.Tally(name = 'flux_moment_at_right_boundary')
-rightflux_tally_moment.filters = [right_filter, expand_filter]
+rightflux_tally_moment.filters = [right_filter, spatial_expand_filter, angle_expand_filter, energy_filter]
 rightflux_tally_moment.scores = ['flux']
 
 # Export tallies to XML

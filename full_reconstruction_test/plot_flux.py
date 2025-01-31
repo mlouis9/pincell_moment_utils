@@ -5,9 +5,15 @@ from matplotlib.colors import LogNorm
 
 pitch = 1.26
 
+# ================
+# Extract Tallies
+# ================
 # Load tally results from OpenMC statepoint file
 statepoint = openmc.StatePoint("statepoint.1000.h5")  # Adjust batch number as needed
 
+# -----------
+# Mesh Tally
+# -----------
 # Extract the tally of interest
 tally = statepoint.get_tally(name="flux_at_right_boundary")
 
@@ -42,6 +48,15 @@ flux_normalized = flux / (delta_y * delta_omega * delta_E[np.newaxis, np.newaxis
 energy_index = len(delta_E) // 4  # Representative energy group (middle of the spectrum)
 angle_index = len(angle_filter.bins) // 2  # Representative angle (middle bin)
 mesh_index = Ny // 2  # Representative y-axis index (middle of the mesh)
+
+# ---------------
+# Moment Tallies
+# ---------------
+
+tally = statepoint.get_tally(name="flux_moment_at_right_boundary")
+
+moment = tally.mean  # The flux values (mean)
+moment_uncertainty = tally.std_dev  # The standard deviation
 
 # Plot a 2D slice with energy fixed
 flux_energy_slice = flux_normalized[:, :, energy_index]  # Fix energy
