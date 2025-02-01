@@ -43,7 +43,7 @@ import pincell_moment_utils.config as config
 from typing import List, Callable
 import numpy as np
 from scipy.special import legendre
-from scipy.integrate import simpson
+from scipy.integrate import simpson, quad
 import itertools
 
 pitch = config.PITCH
@@ -240,6 +240,29 @@ class SurfaceExpansion:
         self.energy_filters = energy_filters
         self.flux_functions = [self._construct_surface_expansion(surface) for surface in range(4) ]
 
+    def integrate_flux(self, surface):
+        """Compute the integral of the surface flux (over the relevant surface phase space)."""
+        spatial_bounds = SPATIAL_BOUNDS[surface]
+        angular_bounds = ANGULAR_BOUNDS[surface]
+
+        energy_filter = self.energy_filters[surface]
+        Δenergy = np.diff(energy_filter.bins)[:, 0]
+        energy_vals = (energy_filter.values[:-1] + energy_filter.values[1:]) / 2
+        
+        # To perform integration over energy values, we just need to choose one energy point from each bin, compute the spatial-angular
+        # integral, then multiply by the energy bin width
+        integral = 0
+        for energy_index in range(len(energy_vals)):
+            # Reconstructed integrated functional expansion
+            energy_integral = 0
+            for i, j, vector_index in itertools.product(range(self.I), range(self.J), range(2)):
+                energy_integral += self.coefficients[surface, i, j, energy_index, vector_index] * integral_basis_function(i, j, vector_index, surface)(
+                    spatial_bounds[0], spatial_bounds[1], angular_bounds[0], angular_bounds[1])
+            
+            integral += Δenergy[energy_index]*np.max(energy_integral, 0) # To eliminate nonphysical negative fluxes
+
+        return integral
+
     def _construct_surface_expansion(self, surface: int) -> Callable[[float, float, float], float]:
         """Used for constructing the surface expansion of the flux from the bsis functions"""
         
@@ -253,7 +276,7 @@ class SurfaceExpansion:
             for i, j, vector_index in itertools.product(range(self.I), range(self.J), range(2)):
                 flux += self.coefficients[surface, i, j, E_idx, vector_index]*basis_function(i, j, vector_index, surface)(y, ω)
 
-            return flux
+            return np.max(flux, 0) # To eliminate unphysical negative values
         
         return reconstructed_flux
 
@@ -296,6 +319,42 @@ def basis_function(i: int, j: int, vector_index: int, surface: int) -> Callable[
             if not ( angular_bounds[0] <= ω <= angular_bounds[1] ):
                 raise ValueError(f"Supplied angle {ω} is not within the angular range [{angular_bounds[0]}, {angular_bounds[1]}]")
             return np.sin(i*np.pi* x/(pitch/2))*legendre(j)(transform_function(ω))
+    else:
+        raise ValueError(f"vector_index must be 0 or 1, you supplied {vector_index}")
+    return basis
+
+def integral_basis_function(i: int, j: int, vector_index: int, surface: int) -> Callable[[float, float, float, float], float]:
+    """Gets the vector_index index of the ith spatial and jth angular integrated basis function on the given surface. Note that
+    the Fourier basis functions may be analytically integrated, and by comparison with the above functions for the basis functions
+    you can verify the simple integration rule used. Due to the transform function, however, to integrate the Legendre basis function we need
+    to use a quadrature rule. Note also the `i != 0` statements are to prevent division by zero."""
+    transform_function = TRANSFORM_FUNCTIONS[surface]
+    spatial_bounds = SPATIAL_BOUNDS[surface]
+    angular_bounds = ANGULAR_BOUNDS[surface]
+    if vector_index == 0:
+        def basis(x_lower, x_upper, ω_lower, ω_upper):
+            for x, ω in zip([x_lower, x_upper], [ω_lower, ω_upper]):
+                if not ( spatial_bounds[0] <= x <= spatial_bounds[1] ):
+                    raise ValueError(f"Supplied spatial point {x} is not within the spatial range [{spatial_bounds[0]}, {spatial_bounds[1]}]")
+                if not ( angular_bounds[0] <= ω <= angular_bounds[1] ):
+                    raise ValueError(f"Supplied angle {ω} is not within the angular range [{angular_bounds[0]}, {angular_bounds[1]}]")
+            if i != 0:
+                return ((pitch/2)/(i*np.pi)* np.sin(i*np.pi* x_upper/(pitch/2)) - 
+                        (pitch/2)/(i*np.pi)* np.sin(i*np.pi* x_lower/(pitch/2)) ) * quad(lambda ω: legendre(j)(transform_function(ω)), ω_lower, ω_upper)[0]
+            else:
+                return (x_upper-x_lower) * quad(lambda ω: legendre(j)(transform_function(ω)), ω_lower, ω_upper)[0]
+    elif vector_index == 1:
+        def basis(x_lower, x_upper, ω_lower, ω_upper): # Returns the integral basis fuction integrated over 
+            for x, ω in zip([x_lower, x_upper], [ω_lower, ω_upper]):
+                if not ( spatial_bounds[0] <= x <= spatial_bounds[1] ):
+                    raise ValueError(f"Supplied spatial point {x} is not within the spatial range [{spatial_bounds[0]}, {spatial_bounds[1]}]")
+                if not ( angular_bounds[0] <= ω <= angular_bounds[1] ):
+                    raise ValueError(f"Supplied angle {ω} is not within the angular range [{angular_bounds[0]}, {angular_bounds[1]}]")
+            if i != 0:
+                return (-(pitch/2)/(i*np.pi)* np.cos(i*np.pi* x_upper/(pitch/2)) + 
+                        (pitch/2)/(i*np.pi)* np.cos(i*np.pi* x_lower/(pitch/2)) )*quad(lambda ω: legendre(j)(transform_function(ω)), ω_lower, ω_upper)[0]
+            else:
+                return 0
     else:
         raise ValueError(f"vector_index must be 0 or 1, you supplied {vector_index}")
     return basis
