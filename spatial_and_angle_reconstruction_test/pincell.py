@@ -195,37 +195,26 @@ settings.export_to_xml()
 # ========
 tallies = openmc.Tallies()
 
-# Cell filters
-# ^^^^^^^^^^^^
-tally_cell_ids = [right_tally_cell.id, left_tally_cell.id, top_tally_cell.id, bottom_tally_cell.id]
-surface_filters = [openmc.CellFilter([tally_cell_id]) for tally_cell_id in tally_cell_ids]
-fuel_filter = openmc.CellFilter([fuel])
+right_filter = openmc.CellFilter([right_tally_cell.id])
+left_filter = openmc.CellFilter([left_tally_cell.id])
+top_filter = openmc.CellFilter([top_tally_cell.id])
+bottom_filter = openmc.CellFilter([bottom_tally_cell.id])
 
-# Zernlike expansion filter
-# ^^^^^^^^^^^^^^^^^^^^^^^^^
+# -----------------------------
+# Functional expansion filters
+# -----------------------------
+# Legendre polynomial expansion filter
 order = 4
-radius = 0.39 # Fuel OR could make it larger in case we want some flux information near the fuel pin, but not for now
-flux_tally_zernike = openmc.Tally(name = "zernike")
-flux_tally_zernike.id = 5
-flux_tally_zernike.scores = ['flux']
-zernike_filter = openmc.ZernikeFilter(order=order, x=0.0, y=0.0, r=radius)
-flux_tally_zernike.filters = [fuel_filter, zernike_filter]
-tallies.append(flux_tally_zernike)
+spatial_expand_filter = openmc.SpatialLegendreFilter(order, 'y', -pitch/2, pitch/2)
+angle_expand_filter = openmc.LegendreFilter(order)
 
-# Meshes along surfaces
-# ^^^^^^^^^^^^^^^^^^^^^
-mesh_filters = []
-N = 40 # number of mesh points along each surface
-dimensions = [[1, N], [1, N], [N, 1], [N, 1]]
-lower_lefts = [[pitch/2, -pitch/2], [-3/4*pitch, -pitch/2], [-pitch/2, pitch/2], [-pitch/2, -3/4*pitch]]
-upper_rights = [[3/4*pitch, pitch/2], [-pitch/2, pitch/2], [pitch/2, 3/4*pitch], [pitch/2, -pitch/2]]
-for surface in range(4):
-    mesh = openmc.Mesh()
-    mesh.dimension = dimensions[surface]  # 1 bin in x, 20 bins in y
-    mesh.lower_left = lower_lefts[surface]  # Narrow region near the right boundary
-    mesh.upper_right = upper_rights[surface]  # Extend over the y range
-    mesh_filter = openmc.MeshFilter(mesh)
-    mesh_filters.append(mesh_filter)
+# Define a 1D mesh along the y-direction
+mesh = openmc.Mesh()
+Ny = 40
+mesh.dimension = [1, Ny]  # 1 bin in x, 20 bins in y
+mesh.lower_left = [pitch/2, -pitch/2]  # Narrow region near the right boundary
+mesh.upper_right = [3/4*pitch, pitch/2]  # Extend over the y range
+mesh_filter = openmc.MeshFilter(mesh)
 
 # Energy filter for multigroup energy binning
 # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -234,49 +223,29 @@ with h5py.File('cas8.h5', 'r') as f:
     energy_groups = f['energy groups'][:]
 
 energy_filter = openmc.EnergyFilter(energy_groups)
+# energy_filter = openmc.EnergyFilter(np.linspace(1E-05, 10E+06, 5))
 
-# Filters for angular binning on surfaces
-# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+# Angular filter for positive x direction binning
 Nω = 20
-angle_filters = []
+px_angle_filter = openmc.AzimuthalFilter(np.linspace(-np.pi/2, np.pi/2, Nω+1))
 
-# Special handling of branch cut of angular domain
-minus_x_angles = np.linspace(np.pi/2, 3/2*np.pi, Nω+2)
-minus_x_angles = np.where(minus_x_angles > np.pi, minus_x_angles - 2*np.pi, minus_x_angles)
-minus_x_angles = np.sort(minus_x_angles)
+rightflux_tally = openmc.Tally(name = 'flux_at_right_boundary')
+rightflux_tally.filters = [right_filter, mesh_filter, px_angle_filter, energy_filter]
+rightflux_tally.scores = ['flux']
 
-angle_ranges_out = [np.linspace(-np.pi/2, np.pi/2, Nω+1), 
-                    minus_x_angles,
-                    np.linspace(0, np.pi, Nω+1),
-                    np.linspace(-np.pi, 0, Nω+1)] # ω ranges corresponding to the outgoig direction on each surface
-for surface in range(4):
-    angle_range = angle_ranges_out[surface]
-    filter = openmc.AzimuthalFilter(angle_ranges_out[surface])
-    angle_filters.append(filter)
-
-
-# Outgoing flux tallies on surfaces
-# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-tally_names = [f'flux_at_{side}_boundary' for side in ['right', 'left', 'top', 'bottom']]
-
-for surface in range(4):
-    tally = openmc.Tally(name = tally_names[surface])
-    tally.id = surface+1
-    tally.filters = [surface_filters[surface], mesh_filters[surface], angle_filters[surface], energy_filter]
-    tally.scores = ['flux']
-    tallies.append(tally)
+rightflux_tally_moment = openmc.Tally(name = 'flux_moment_at_right_boundary')
+rightflux_tally_moment.filters = [right_filter, spatial_expand_filter, angle_expand_filter, energy_filter]
+rightflux_tally_moment.scores = ['flux']
 
 # keff tally
-# ^^^^^^^^^^
 # Tally for counting fissions in the fuel
 fission_tally = openmc.Tally(name='keff')
-fission_tally.id = 6
 fuel_filter = openmc.CellFilter(fuel.id)
 fission_tally.filters = [fuel_filter]
 fission_tally.scores = ['fission']
-tallies.append(fission_tally)
 
 # Export tallies to XML
+tallies += [rightflux_tally, rightflux_tally_moment, fission_tally]
 tallies.export_to_xml()
 
 
