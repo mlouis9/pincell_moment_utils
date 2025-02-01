@@ -230,7 +230,7 @@ for surface in range(4):
 # Energy filter for multigroup energy binning
 # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 # Read in CASMO 70 group structure from h5
-with h5py.File('cas8.h5', 'r') as f:
+with h5py.File('../data/cas8.h5', 'r') as f:
     energy_groups = f['energy groups'][:]
 
 energy_filter = openmc.EnergyFilter(energy_groups)
