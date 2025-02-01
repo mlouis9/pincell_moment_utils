@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "pincell_moment_utils"
+version = "0.0.1"
+description = "A tool for postprocessing and calculating flux moments for a pincell model"
+authors = [
+    "Matthew Louis <matthewlouis31@gmail.com>"
+]
+license = "MIT"
+readme = "README.md"
+documentation = "https://mlouis9.github.io/pincell_moment_utils"
+
+[tool.poetry.dependencies]
+python = "^3.8"
+matplotlib = "*"
+pandas = "*"
+scipy = "*"
+pyprojroot = "*"
+openmc = "*"
+
+[tool.poetry.group.dev-dependencies.dependencies]
+pytest = "^5.2"
+
+# Additional metadata and URLs for the project
+[tool.poetry.urls]
+"Homepage" = "https://github.com/mlouis9/pincell_moment_utils"
+"Issues" = "https://github.com/mlouis9/pincell_moment_utils/issues"

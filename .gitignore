@@ -1,0 +1,14 @@
+# Ignore .xml files
+*.xml
+# Ignore images
+*.png
+*.jpg
+# Ignore all .h5 and .out output files 
+*.h5
+*.out
+# Except energy group .h5 files
+!cas70.h5
+!cas25.h5
+!cas8.h5
+# Ignore distribution binaries
+dist
