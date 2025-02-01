@@ -49,6 +49,8 @@ from itertools import product
 pitch = config.PITCH
 TRANSFORM_FUNCTIONS = config.TRANSFORM_FUNCTIONS
 WEIGHT_FUNCTIONS = config.WEIGHT_FUNCTIONS
+ANGULAR_BOUNDS = config.ANGULAR_BOUNDS
+SPATIAL_BOUNDS = config.SPATIAL_BOUNDS
 
 class SurfaceMeshTally:
     """A class for postprocessing surface flux mesh tallies"""
@@ -64,6 +66,7 @@ class SurfaceMeshTally:
         # Store spatial meshes in a list for each surface
         self.meshes = []
         self.fluxes = []
+        self.energy_filters = []
         for id in range(1, 5):
             tally = self.statepoint.get_tally(id=id)
             spatial_vals, angle_vals, energy_vals, energy_filter = self.extract_meshes(tally)
@@ -72,6 +75,7 @@ class SurfaceMeshTally:
             N_space, N_angle, N_energy = len(spatial_vals), len(angle_vals), len(energy_vals)
 
             self.meshes.append([spatial_vals, angle_vals, energy_vals])
+            self.energy_filters.append(energy_filter)
 
             # Filter out high uncertainty mesh tallies
             flux = tally.mean  # The flux values (mean)
@@ -158,7 +162,7 @@ def compute_moments(mesh_tally: SurfaceMeshTally, I: int, J: int) -> np.ndarray:
 
         for i, j, vector_index in product(range(I), range(J), range(2)):
             # Evaluate integrand functions on spatial and angular mesh
-            integrand_function = _integrand_functions(i, j, vector_index, SurfaceMeshTally)
+            integrand_function = _integrand_functions(i, j, vector_index, surface)
             integrand_eval = _evaluate_integrand(integrand_function, space_vals, angle_vals)
             
             for k in range(N_energy):
@@ -166,14 +170,14 @@ def compute_moments(mesh_tally: SurfaceMeshTally, I: int, J: int) -> np.ndarray:
                 integrand_eval *= flux[:, :, k]
                 
                 # Compute and assign the coefficient
-                coefs[surface, i, j, k, vector_index] = _compute_integral(integrand_eval, i, j, vector_index, space_vals, angle_vals)
+                coefs[surface, i, j, k, vector_index] = _compute_integral(flux[:, :, k]*integrand_eval, i, j, vector_index, space_vals, angle_vals)
 
     return coefs
 
 
 def _integrand_functions(i: int, j: int, vector_index: int, surface: int) -> Callable[[float, float], float]:
     """Returns the basis function corresponding to a given i, j, and vector index in the function expansion"""
-
+    
     weight_function = WEIGHT_FUNCTIONS[surface]
     transform_function = TRANSFORM_FUNCTIONS[surface]
     if vector_index == 0:
@@ -193,7 +197,7 @@ def _evaluate_integrand(integrand_function: Callable[[float, float], float], spa
             integrand_eval[y_idx, ω_idx] = integrand_function(x, ω)
     return integrand_eval
 
-def _compute_integral(integrand_eval, i, j, vector_index, space_vals, angle_vals):
+def _compute_integral(integrand_eval: np.ndarray, i:int , j:int , vector_index:int , space_vals: np.ndarray, angle_vals: np.ndarray) -> float:
     # Base case: integral over cosine for zero angular frequency
     if i == 0:
         if vector_index == 0:
@@ -202,3 +206,67 @@ def _compute_integral(integrand_eval, i, j, vector_index, space_vals, angle_vals
             return 0  # Sine basis integral is zero
     else:
         return (2 * j + 1) / pitch * simpson(simpson(integrand_eval, space_vals, axis=0), angle_vals, axis=0)
+
+
+class SurfaceExpansion:
+    """Used for creating and evaluating the functional expansion of the surface flux from a given set of moments/coefficients"""
+    energy_filter: openmc.Filter
+    """Energy filter for the given expansion"""
+    I: int
+    """Spatial expansion max index, 0 ≤ i ≤ I"""
+    J: int
+    """Angular expansion max index, 0 ≤ j ≤ J"""
+    flux_functions: List[Callable[[float, float, float], float]]
+    """List of surface flux functions for each of the surfaces"""
+    def __init__(self, coefficients: np.ndarray, energy_filters: list):
+        """Coefficients assumed to be of shape (4 × I × J × N_energy × 2) where I is the spatial expansion max index, J is the angular
+        expansion max index, and N_energy is the number of energy groups."""
+        
+        _, self.I, self.J, self.N_energy, _ = coefficients.shape
+        self.coefficients = coefficients
+        self.energy_filters = energy_filters
+        self.flux_functions = [self._construct_surface_expansion(surface) for surface in range(4) ]
+
+    def _construct_surface_expansion(self, surface: int) -> Callable[[float, float, float], float]:
+        """Used for constructing the surface expansion of the flux from the bsis functions"""
+        
+        def reconstructed_flux(y, ω, E):
+            E_idx = 0
+            for bin_idx, bin in enumerate(self.energy_filters[surface].bins):
+                if bin[0] <= E <= bin[1]:
+                    E_idx = bin_idx
+
+            flux = 0
+            for i, j, vector_index in product(range(self.I), range(self.J), range(2)):
+                flux += self.coefficients[surface, i, j, E_idx, vector_index]*basis_function(i, j, vector_index, surface)(y, ω)
+
+            return flux
+        
+        return reconstructed_flux
+
+    def evaluate_on_grid():
+        pass
+
+
+def basis_function(i: int, j: int, vector_index: int, surface: int) -> Callable[[float, float], float]:
+    """Gets the vector_index index of the ith spatial and jth angular basis function on the given surface"""
+    transform_function = TRANSFORM_FUNCTIONS[surface]
+    spatial_bounds = SPATIAL_BOUNDS[surface]
+    angular_bounds = ANGULAR_BOUNDS[surface]
+    if vector_index == 0:
+        def basis(x, ω):
+            if not ( spatial_bounds[0] <= x <= spatial_bounds[1] ):
+                raise ValueError(f"Supplied spatial point {x} is not within the spatial range [{spatial_bounds[0]}, {spatial_bounds[1]}]")
+            if not ( angular_bounds[0] <= ω <= angular_bounds[1] ):
+                raise ValueError(f"Supplied angle {ω} is not within the angular range [{angular_bounds[0]}, {angular_bounds[1]}]")
+            return np.cos(i*np.pi* x/(pitch/2))*legendre(j)(transform_function(ω))
+    elif vector_index == 1:
+        def basis(x, ω):
+            if not ( spatial_bounds[0] <= x <= spatial_bounds[1] ):
+                raise ValueError(f"Supplied spatial point {x} is not within the spatial range [{spatial_bounds[0]}, {spatial_bounds[1]}]")
+            if not ( angular_bounds[0] <= ω <= angular_bounds[1] ):
+                raise ValueError(f"Supplied angle {ω} is not within the angular range [{angular_bounds[0]}, {angular_bounds[1]}]")
+            return np.sin(i*np.pi* x/(pitch/2))*legendre(j)(transform_function(ω))
+    else:
+        raise ValueError(f"vector_index must be 0 or 1, you supplied {vector_index}")
+    return basis
