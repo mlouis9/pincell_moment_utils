@@ -44,7 +44,7 @@ from typing import List, Callable
 import numpy as np
 from scipy.special import legendre
 from scipy.integrate import simpson
-from itertools import product
+import itertools
 
 pitch = config.PITCH
 TRANSFORM_FUNCTIONS = config.TRANSFORM_FUNCTIONS
@@ -154,58 +154,71 @@ def compute_moments(mesh_tally: SurfaceMeshTally, I: int, J: int) -> np.ndarray:
     _, _, energy_vals = mesh_tally.meshes[0]
     N_energy = len(energy_vals)
 
-    coefs = np.zeros((4, I, J, N_energy, 2)) # Note for this particular expansion, coefficients are vectors in R^2, hence the last 2
-    
+    coefs = np.zeros((4, I, J, N_energy, 2))  # Coefficients
+
     for surface in range(4):
-        space_vals, angle_vals, energy_vals = mesh_tally.meshes[0]
+        space_vals, angle_vals, _ = mesh_tally.meshes[surface]
         flux = mesh_tally.fluxes[surface]
 
-        for i, j, vector_index in product(range(I), range(J), range(2)):
-            # Evaluate integrand functions on spatial and angular mesh
-            integrand_function = _integrand_functions(i, j, vector_index, surface)
-            integrand_eval = _evaluate_integrand(integrand_function, space_vals, angle_vals)
-            
+        # Precompute basis functions
+        basis_cache = precompute_basis_functions(space_vals, angle_vals, I, J, surface, moment_calculation=True)
+
+        for i, j, vector_index in itertools.product(range(I), range(J), range(2)):
+            # Retrieve precomputed basis function
+            integrand_eval = basis_cache[(i, j, vector_index)]
+
             for k in range(N_energy):
-                # Multiply the basis functions with the flux
-                integrand_eval *= flux[:, :, k]
-                
-                # Compute and assign the coefficient
-                coefs[surface, i, j, k, vector_index] = _compute_integral(flux[:, :, k]*integrand_eval, i, j, vector_index, space_vals, angle_vals)
+                # Compute product of flux and integrand
+                product = flux[:, :, k] * integrand_eval
+
+                # Perform integration
+                if i == 0: # Integral over cosine with zero angular frequency causes different prefactor
+                    if vector_index == 0:
+                        coefs[surface, i, j, k, vector_index] = (2*j+1)/(2*pitch)*simpson(simpson(product, space_vals, axis=0), angle_vals, axis=0)
+                    else: # Sine basis integral is zero
+                        coefs[surface, i, j, k, vector_index] = 0
+                else:
+                    coefs[surface, i, j, k, vector_index] = (2*j+1)/(pitch)*simpson(simpson(product, space_vals, axis=0), angle_vals, axis=0)
 
     return coefs
 
-
-def _integrand_functions(i: int, j: int, vector_index: int, surface: int) -> Callable[[float, float], float]:
-    """Returns the basis function corresponding to a given i, j, and vector index in the function expansion"""
+def precompute_basis_functions(space_vals: np.ndarray, angle_vals: np.ndarray, I: int, J: int, surface: int, 
+                               moment_calculation: bool=False):
+    """Function used for precomputing basis functions on a grid, for fast evaluation of moments and function expansions.
     
-    weight_function = WEIGHT_FUNCTIONS[surface]
+    Parameters
+    ----------
+    space_vals
+        Spatial mesh to precompute basis functions on
+    angle_vals
+        Angular mesh to precompute basis functions on
+    I
+        Maximum spatial expansion index
+    J
+        Maximum angular expansion index
+    surface
+        Surface index (affects the form of the Legendre transformation functions and weights if used)
+    moment_calculation
+        Whether or not these basis functions will be used to compute moments. If so, also include the weighting function in for proper
+        integration
+    """
+    basis_cache = {}
     transform_function = TRANSFORM_FUNCTIONS[surface]
-    if vector_index == 0:
-        def integrand(x: float, ω: float) -> float:
-            return np.cos(i*np.pi* x/(pitch/2))*legendre(j)(transform_function(ω))*weight_function(ω)
-    elif vector_index == 1:
-        def integrand(x: float, ω: float) -> float:
-            return np.sin(i*np.pi* x/(pitch/2))*legendre(j)(transform_function(ω))*weight_function(ω)
+    
+    if moment_calculation:
+        weight_function = WEIGHT_FUNCTIONS[surface]
     else:
-        raise ValueError(f"vector_index must be 0 or 1, you supplied {vector_index}")
-    return integrand
+        weight_function = lambda x: 1
 
-def _evaluate_integrand(integrand_function: Callable[[float, float], float], space_vals, angle_vals):
-    integrand_eval = np.zeros((len(space_vals), len(angle_vals)))
-    for y_idx, x in enumerate(space_vals):
-        for ω_idx, ω in enumerate(angle_vals):
-            integrand_eval[y_idx, ω_idx] = integrand_function(x, ω)
-    return integrand_eval
-
-def _compute_integral(integrand_eval: np.ndarray, i:int , j:int , vector_index:int , space_vals: np.ndarray, angle_vals: np.ndarray) -> float:
-    # Base case: integral over cosine for zero angular frequency
-    if i == 0:
-        if vector_index == 0:
-            return (2 * j + 1) / (2 * pitch) * simpson(simpson(integrand_eval, space_vals, axis=0), angle_vals, axis=0)
-        else:
-            return 0  # Sine basis integral is zero
-    else:
-        return (2 * j + 1) / pitch * simpson(simpson(integrand_eval, space_vals, axis=0), angle_vals, axis=0)
+    for i, j in itertools.product(range(I), range(J)):
+        cos_basis = np.cos(i * np.pi * space_vals[:, None] / (pitch / 2))  # Precompute spatial part
+        leg_basis = legendre(j)(transform_function(angle_vals)) * weight_function(angle_vals)  # Precompute angular part
+        basis_cache[(i, j, 0)] = cos_basis * leg_basis
+        
+        sin_basis = np.sin(i * np.pi * space_vals[:, None] / (pitch / 2))
+        basis_cache[(i, j, 1)] = sin_basis * leg_basis
+    
+    return basis_cache
 
 
 class SurfaceExpansion:
@@ -237,15 +250,31 @@ class SurfaceExpansion:
                     E_idx = bin_idx
 
             flux = 0
-            for i, j, vector_index in product(range(self.I), range(self.J), range(2)):
+            for i, j, vector_index in itertools.product(range(self.I), range(self.J), range(2)):
                 flux += self.coefficients[surface, i, j, E_idx, vector_index]*basis_function(i, j, vector_index, surface)(y, ω)
 
             return flux
         
         return reconstructed_flux
 
-    def evaluate_on_grid():
-        pass
+    def evaluate_on_grid(self, surface: int, grid_points: np.ndarray):
+        """Evaluate the flux on a grid of spatial, angular, and energy points"""
+        space_vals, angle_vals, energy_vals = grid_points
+        flux = np.zeros((len(space_vals), len(angle_vals), len(energy_vals)))
+
+        # Precompute basis functions
+        basis_cache = precompute_basis_functions(space_vals, angle_vals, self.I, self.J, surface)
+
+        for i, j, vector_index in itertools.product(range(self.I), range(self.J), range(2)):
+            for k, E in enumerate(energy_vals):
+                E_idx = 0
+                for bin_idx, bin in enumerate(self.energy_filters[surface].bins):
+                    if bin[0] <= E <= bin[1]:
+                        E_idx = bin_idx
+                coef = self.coefficients[surface, i, j, E_idx, vector_index]
+                flux[:, :, k] += coef * basis_cache[(i, j, vector_index)]
+
+        return np.maximum(flux, 0) # To avoid returning nonphysical negative values
 
 
 def basis_function(i: int, j: int, vector_index: int, surface: int) -> Callable[[float, float], float]:
