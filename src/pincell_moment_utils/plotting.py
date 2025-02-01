@@ -28,7 +28,7 @@ def reconstruction_comparison(expansion: SurfaceExpansion, mesh_tally: SurfaceMe
     surface
         The surface whose surface fluxes you'd like to compare
     option
-        Plot option: 'expansion', 'benchmark', 'relative_difference', either plot the expansion, the benchmark, or the relative difference
+        Plot option: 'expansion', 'mesh_tally', 'relative_difference', either plot the expansion, the mesh_tally, or the relative difference
         between them
     """
     # Get meshes relevant for plotting and evaluating the reconstructed flux
@@ -46,8 +46,10 @@ def reconstruction_comparison(expansion: SurfaceExpansion, mesh_tally: SurfaceMe
             vmax = 1.0
         case 'expansion':
             plot_vals = expansion_vals
-        case 'benchmark':
+        case 'mesh_tally':
             plot_vals = mesh_vals
+        case _:
+            raise ValueError(f"Invalid option: {option}. Choose from 'relative_difference', 'expansion', or 'mesh_tally'.")
 
     # Plot a 2D slice with energy fixed
     flux_energy_slice = plot_vals[:, :, energy_index]  # Fix energy
@@ -56,7 +58,7 @@ def reconstruction_comparison(expansion: SurfaceExpansion, mesh_tally: SurfaceMe
                extent=[SPATIAL_BOUNDS[surface][0], SPATIAL_BOUNDS[surface][1], ANGULAR_BOUNDS[surface][0], ANGULAR_BOUNDS[surface][1]], 
                aspect="auto",norm=LogNorm(vmax=vmax))
     plt.colorbar(label="Flux (normalized)")
-    plt.xlabel("y-position")
+    plt.xlabel("Position")
     plt.ylabel("Angle (rad)")
     plt.title(f"Flux Slice at Energy {energy_vals[energy_index]} eV")
     plt.show()
