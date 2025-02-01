@@ -35,14 +35,20 @@ _______________________________________ _ _ _ _ _ 3/4 pitch
 
 2. The labeling of the surfaces as 1,2,3,4 is assumed to be consistent with the tally ID
 3. Spatial and angular meshes have uniform spacing (implicit in the chosen normalization)
+4. All surfaces have the same number of anglular and spatial points (i.e. the same N_space, N_angle)
 """
 
 import openmc
 import pincell_moment_utils.config as config
-from typing import List
+from typing import List, Callable
 import numpy as np
+from scipy.special import legendre
+from scipy.integrate import simpson
+from itertools import product
 
 pitch = config.PITCH
+TRANSFORM_FUNCTIONS = config.TRANSFORM_FUNCTIONS
+WEIGHT_FUNCTIONS = config.WEIGHT_FUNCTIONS
 
 class SurfaceMeshTally:
     """A class for postprocessing surface flux mesh tallies"""
@@ -54,7 +60,7 @@ class SurfaceMeshTally:
         self.statepoint = openmc.StatePoint(statepoint_filename)
         self.extract_surface_flux()
 
-    def extract_surface_flux(self):
+    def extract_surface_flux(self) -> None:
         # Store spatial meshes in a list for each surface
         self.meshes = []
         self.fluxes = []
@@ -127,4 +133,72 @@ class SurfaceMeshTally:
         energy_vals = (energy_filter.values[:-1] + energy_filter.values[1:]) / 2
 
         return [spatial_vals, angle_vals, energy_vals, energy_filter]
+
+
+def compute_moments(mesh_tally: SurfaceMeshTally, I: int, J: int) -> np.ndarray:
+    """Compute moments of a Fourier spatial expansion and a Legendre angular expansion for each surface in a given mesh tally object
     
+    Parameters
+    ----------
+    mesh_tally
+        The mesh `SurfaceMeshTally` object to use for computing the moments
+    I
+        Spatial expansion maximum index, 0 ≤ i ≤ I
+    J
+        Angular expansion maximum index, 0 ≤ j ≤ J"""
+    
+    _, _, energy_vals = mesh_tally.meshes[0]
+    N_energy = len(energy_vals)
+
+    coefs = np.zeros((4, I, J, N_energy, 2)) # Note for this particular expansion, coefficients are vectors in R^2, hence the last 2
+    
+    for surface in range(4):
+        space_vals, angle_vals, energy_vals = mesh_tally.meshes[0]
+        flux = mesh_tally.fluxes[surface]
+
+        for i, j, vector_index in product(range(I), range(J), range(2)):
+            # Evaluate integrand functions on spatial and angular mesh
+            integrand_function = _integrand_functions(i, j, vector_index, SurfaceMeshTally)
+            integrand_eval = _evaluate_integrand(integrand_function, space_vals, angle_vals)
+            
+            for k in range(N_energy):
+                # Multiply the basis functions with the flux
+                integrand_eval *= flux[:, :, k]
+                
+                # Compute and assign the coefficient
+                coefs[surface, i, j, k, vector_index] = _compute_integral(integrand_eval, i, j, vector_index, space_vals, angle_vals)
+
+    return coefs
+
+
+def _integrand_functions(i: int, j: int, vector_index: int, surface: int) -> Callable[[float, float], float]:
+    """Returns the basis function corresponding to a given i, j, and vector index in the function expansion"""
+
+    weight_function = WEIGHT_FUNCTIONS[surface]
+    transform_function = TRANSFORM_FUNCTIONS[surface]
+    if vector_index == 0:
+        def integrand(x: float, ω: float) -> float:
+            return np.cos(i*np.pi* x/(pitch/2))*legendre(j)(transform_function(ω))*weight_function(ω)
+    elif vector_index == 1:
+        def integrand(x: float, ω: float) -> float:
+            return np.sin(i*np.pi* x/(pitch/2))*legendre(j)(transform_function(ω))*weight_function(ω)
+    else:
+        raise ValueError(f"vector_index must be 0 or 1, you supplied {vector_index}")
+    return integrand
+
+def _evaluate_integrand(integrand_function: Callable[[float, float], float], space_vals, angle_vals):
+    integrand_eval = np.zeros((len(space_vals), len(angle_vals)))
+    for y_idx, x in enumerate(space_vals):
+        for ω_idx, ω in enumerate(angle_vals):
+            integrand_eval[y_idx, ω_idx] = integrand_function(x, ω)
+    return integrand_eval
+
+def _compute_integral(integrand_eval, i, j, vector_index, space_vals, angle_vals):
+    # Base case: integral over cosine for zero angular frequency
+    if i == 0:
+        if vector_index == 0:
+            return (2 * j + 1) / (2 * pitch) * simpson(simpson(integrand_eval, space_vals, axis=0), angle_vals, axis=0)
+        else:
+            return 0  # Sine basis integral is zero
+    else:
+        return (2 * j + 1) / pitch * simpson(simpson(integrand_eval, space_vals, axis=0), angle_vals, axis=0)
