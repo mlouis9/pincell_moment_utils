@@ -16,6 +16,8 @@ pandas = "*"
 scipy = "*"
 pyprojroot = "*"
 openmc = "*"
+numpy = "*"
+typing = "*"
 
 [tool.poetry.group.dev-dependencies.dependencies]
 pytest = "^5.2"

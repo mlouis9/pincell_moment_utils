@@ -241,8 +241,10 @@ Nω = 20
 angle_filters = []
 
 # Special handling of branch cut of angular domain
-minus_x_angles = np.linspace(np.pi/2, 3/2*np.pi, Nω+2)
-minus_x_angles = np.where(minus_x_angles > np.pi, minus_x_angles - 2*np.pi, minus_x_angles)
+minus_x_angles = np.concatenate(
+    (np.linspace(np.pi/2, np.pi, Nω//2 + 1),
+    np.linspace(-np.pi, -np.pi/2, Nω//2 + 1))
+)
 minus_x_angles = np.sort(minus_x_angles) 
 # Angles no longer in descending order, and creates a artifactual bin at [-π/2, π/2] that must be handled in postprocessing, but
 # required for monotonicity of the angular mesh required by OpenMC

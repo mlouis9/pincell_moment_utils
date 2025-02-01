@@ -13,3 +13,6 @@
 !cas8.h5
 # Ignore distribution binaries
 dist
+
+# Ignore pycache
+**/__pycache__
