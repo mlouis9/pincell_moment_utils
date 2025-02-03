@@ -1,4 +1,4 @@
-"""
+r"""
 This is a module for postprocessing results of the pincell simulation, namely mesh tallies which are used to compute functional expansion
 moments, as well as tallied moments for zernlike expansions.
 
@@ -40,7 +40,7 @@ _______________________________________ _ _ _ _ _ 3/4 pitch
 
 import openmc
 import pincell_moment_utils.config as config
-from typing import List, Callable
+from typing import List, Callable, Union
 import numpy as np
 from scipy.special import legendre
 from scipy.integrate import simpson, quad
@@ -69,7 +69,7 @@ class SurfaceMeshTally:
         self.energy_filters = []
         for id in range(1, 5):
             tally = self.statepoint.get_tally(id=id)
-            spatial_vals, angle_vals, energy_vals, energy_filter = self.extract_meshes(tally)
+            spatial_vals, angle_vals, energy_vals, energy_filter = self._extract_meshes(tally)
 
             # Number of space, angle, and energy points in mesh
             N_space, N_angle, N_energy = len(spatial_vals), len(angle_vals), len(energy_vals)
@@ -108,7 +108,7 @@ class SurfaceMeshTally:
             flux /= (Δspace * Δangle * Δenergy[np.newaxis, np.newaxis, :])
             self.fluxes.append(flux)
 
-    def extract_meshes(self, tally) -> List[np.ndarray]:
+    def _extract_meshes(self, tally) -> List[np.ndarray]:
         """Extract meshes from tallies that have them. Assumed spatial, angular, and energy meshes.
         
         Returns
@@ -161,7 +161,7 @@ def compute_moments(mesh_tally: SurfaceMeshTally, I: int, J: int) -> np.ndarray:
         flux = mesh_tally.fluxes[surface]
 
         # Precompute basis functions
-        basis_cache = precompute_basis_functions(space_vals, angle_vals, I, J, surface, moment_calculation=True)
+        basis_cache = _precompute_basis_functions(space_vals, angle_vals, I, J, surface, moment_calculation=True)
 
         for i, j, vector_index in itertools.product(range(I), range(J), range(2)):
             # Retrieve precomputed basis function
@@ -182,7 +182,7 @@ def compute_moments(mesh_tally: SurfaceMeshTally, I: int, J: int) -> np.ndarray:
 
     return coefs
 
-def precompute_basis_functions(space_vals: np.ndarray, angle_vals: np.ndarray, I: int, J: int, surface: int, 
+def _precompute_basis_functions(space_vals: np.ndarray, angle_vals: np.ndarray, I: int, J: int, surface: int, 
                                moment_calculation: bool=False):
     """Function used for precomputing basis functions on a grid, for fast evaluation of moments and function expansions.
     
@@ -223,14 +223,18 @@ def precompute_basis_functions(space_vals: np.ndarray, angle_vals: np.ndarray, I
 
 class SurfaceExpansion:
     """Used for creating and evaluating the functional expansion of the surface flux from a given set of moments/coefficients"""
-    energy_filter: openmc.Filter
-    """Energy filter for the given expansion"""
+    energy_filters: list
+    """Energy filters for the given expansion on each surface"""
+    energy_bounds: List[List[float]]
+    """The upper and lower energy bounds for the flux expansion on each surface"""
     I: int
     """Spatial expansion max index, 0 ≤ i ≤ I"""
     J: int
     """Angular expansion max index, 0 ≤ j ≤ J"""
     flux_functions: List[Callable[[float, float, float], float]]
     """List of surface flux functions for each of the surfaces"""
+    coefficients: np.ndarray
+    """Coefficients of the functional expansion of the flux on each surface, of shape (4 × I × J × N_energy × 2)"""
     def __init__(self, coefficients: np.ndarray, energy_filters: list):
         """Coefficients assumed to be of shape (4 × I × J × N_energy × 2) where I is the spatial expansion max index, J is the angular
         expansion max index, and N_energy is the number of energy groups."""
@@ -238,9 +242,29 @@ class SurfaceExpansion:
         _, self.I, self.J, self.N_energy, _ = coefficients.shape
         self.coefficients = coefficients
         self.energy_filters = energy_filters
+        self.energy_bounds = self._get_energy_bounds()
         self.flux_functions = [self._construct_surface_expansion(surface) for surface in range(4) ]
 
-    def integrate_flux(self, surface):
+    def normalize_by(self, normalization_const: Union[float, List[float]]) -> None:
+        """Normalize all surface flux functions by a global normalization constant, or normalize each surface by an individual normalization
+        constant
+        
+        Parameters
+        ----------
+        normalization_const
+            Either a single global normalization constant for all surfaces, or a list of normalization constants for each surface"""
+        if isinstance(normalization_const, float):
+            self.coefficients = self.coefficients/normalization_const
+        elif isinstance(normalization_const, list) or isinstance(normalization_const, np.ndarray):
+            for surface in range(4):
+                self.coefficients[surface, :, :, :, :] /= normalization_const[surface]
+        else:
+            raise ValueError(f"Normalization constant can only be of type float or list, you supplied type {type(normalization_const)}")
+        
+        # Now reconstruct the flux functions with these normalized coefficients
+        self.flux_functions = [self._construct_surface_expansion(surface) for surface in range(4) ]
+
+    def integrate_flux(self, surface: int) -> float:
         """Compute the integral of the surface flux (over the relevant surface phase space)."""
         spatial_bounds = SPATIAL_BOUNDS[surface]
         angular_bounds = ANGULAR_BOUNDS[surface]
@@ -256,12 +280,46 @@ class SurfaceExpansion:
             # Reconstructed integrated functional expansion
             energy_integral = 0
             for i, j, vector_index in itertools.product(range(self.I), range(self.J), range(2)):
-                energy_integral += self.coefficients[surface, i, j, energy_index, vector_index] * integral_basis_function(i, j, vector_index, surface)(
+                energy_integral += self.coefficients[surface, i, j, energy_index, vector_index] * _integral_basis_function(i, j, vector_index, surface)(
                     spatial_bounds[0], spatial_bounds[1], angular_bounds[0], angular_bounds[1])
             
             integral += Δenergy[energy_index]*np.max(energy_integral, 0) # To eliminate nonphysical negative fluxes
 
         return integral
+    
+    def generate_samples(self, N: int):
+        """Generate N samples from the flux functions across all surfaces in accordance with their relative norms"""
+
+        samples = []
+
+        # First generate the normalization factors for the PDF over all surfaces
+        norm_consts = np.zeros(4)
+        for surface in range(4):
+            norm_consts[surface] = self.integrate_flux(surface)
+
+        # Now normalize each of the individual surface flux functions by their respective norms
+        self.normalize_by(norm_consts)
+
+        # Compute the number of samples to generate from each surface. Fix rounding via surface 4
+        N_surface = np.floor(N * norm_consts/np.sum(norm_consts)).astype(int)
+        N_surface[3] += N - np.sum(N_surface) # Ensures that the total number of samples is N
+
+        for surface in range(4):
+            spatial_bounds = config.SPATIAL_BOUNDS
+            angular_bounds = config.ANGULAR_BOUNDS
+            energy_bounds = self._get_energy_bounds()
+            domain = [(bounds[0], bounds[1]) for bounds in [spatial_bounds[surface], angular_bounds[surface], energy_bounds[surface]]]
+            samples.append(rejection_sampling_3d(self.flux_functions[surface], domain, N_surface[surface]))
+
+        # Undo the surface normalization
+        self.normalize_by(1/norm_consts)
+    
+        return samples
+
+    def _get_energy_bounds(self) -> List[List[float]]:
+        """Returns a list of energy bounds for each surface"""
+        energy_bounds = [ [ self.energy_filters[surface].bins[0,0], self.energy_filters[surface].bins[-1,1] ] for surface in range(4) ]
+        return energy_bounds
 
     def _construct_surface_expansion(self, surface: int) -> Callable[[float, float, float], float]:
         """Used for constructing the surface expansion of the flux from the bsis functions"""
@@ -274,7 +332,7 @@ class SurfaceExpansion:
 
             flux = 0
             for i, j, vector_index in itertools.product(range(self.I), range(self.J), range(2)):
-                flux += self.coefficients[surface, i, j, E_idx, vector_index]*basis_function(i, j, vector_index, surface)(y, ω)
+                flux += self.coefficients[surface, i, j, E_idx, vector_index]*_basis_function(i, j, vector_index, surface)(y, ω)
 
             return np.max(flux, 0) # To eliminate unphysical negative values
         
@@ -286,7 +344,7 @@ class SurfaceExpansion:
         flux = np.zeros((len(space_vals), len(angle_vals), len(energy_vals)))
 
         # Precompute basis functions
-        basis_cache = precompute_basis_functions(space_vals, angle_vals, self.I, self.J, surface)
+        basis_cache = _precompute_basis_functions(space_vals, angle_vals, self.I, self.J, surface)
 
         for i, j, vector_index in itertools.product(range(self.I), range(self.J), range(2)):
             for k, E in enumerate(energy_vals):
@@ -300,7 +358,7 @@ class SurfaceExpansion:
         return np.maximum(flux, 0) # To avoid returning nonphysical negative values
 
 
-def basis_function(i: int, j: int, vector_index: int, surface: int) -> Callable[[float, float], float]:
+def _basis_function(i: int, j: int, vector_index: int, surface: int) -> Callable[[float, float], float]:
     """Gets the vector_index index of the ith spatial and jth angular basis function on the given surface"""
     transform_function = TRANSFORM_FUNCTIONS[surface]
     spatial_bounds = SPATIAL_BOUNDS[surface]
@@ -323,7 +381,7 @@ def basis_function(i: int, j: int, vector_index: int, surface: int) -> Callable[
         raise ValueError(f"vector_index must be 0 or 1, you supplied {vector_index}")
     return basis
 
-def integral_basis_function(i: int, j: int, vector_index: int, surface: int) -> Callable[[float, float, float, float], float]:
+def _integral_basis_function(i: int, j: int, vector_index: int, surface: int) -> Callable[[float, float, float, float], float]:
     """Gets the vector_index index of the ith spatial and jth angular integrated basis function on the given surface. Note that
     the Fourier basis functions may be analytically integrated, and by comparison with the above functions for the basis functions
     you can verify the simple integration rule used. Due to the transform function, however, to integrate the Legendre basis function we need
@@ -358,3 +416,54 @@ def integral_basis_function(i: int, j: int, vector_index: int, surface: int) -> 
     else:
         raise ValueError(f"vector_index must be 0 or 1, you supplied {vector_index}")
     return basis
+
+
+def rejection_sampling_3d(target_pdf: Callable[[float, float, float], float], domain: List[List[float]], num_samples: int) -> np.ndarray:
+    """
+    Perform rejection sampling for a 3-variable probability distribution.
+
+    Parameters:
+        target_pdf
+            The normalized target PDF function, target_pdf(x), where x is a 3D point.
+        domain
+            A list of tuples [(x_min, x_max), (y_min, y_max), (z_min, z_max)] defining the 3D domain.
+        num_samples
+            The number of samples to generate.
+
+    Returns:
+        An array of shape (num_samples, 3) containing the generated samples.
+    """
+    # Extract bounds from the domain
+    x_bounds, y_bounds, z_bounds = domain
+    x_min, x_max = x_bounds
+    y_min, y_max = y_bounds
+    z_min, z_max = z_bounds
+
+    # Compute the volume of the domain (for the uniform proposal PDF)
+    domain_volume = (x_max - x_min) * (y_max - y_min) * (z_max - z_min)
+
+    # Uniform proposal PDF value (constant across the domain)
+    proposal_pdf_value = 1 / domain_volume
+
+    # Function to uniformly sample a point within the defined domain
+    def sample_from_domain():
+        x = np.random.uniform(x_min, x_max)
+        y = np.random.uniform(y_min, y_max)
+        z = np.random.uniform(z_min, z_max)
+        return np.array([x, y, z])
+
+    # Perform rejection sampling
+    samples = []
+    while len(samples) < num_samples:
+        # Sample a candidate point from the uniform proposal
+        candidate = sample_from_domain()
+
+        # Generate a uniform random number in [0, 1] for acceptance check
+        u = np.random.uniform(0, 1)
+
+        # Check acceptance criterion
+        if u < target_pdf(*candidate) / proposal_pdf_value:
+            samples.append(candidate)
+
+    # Return the generated samples as a NumPy array
+    return np.array(samples)

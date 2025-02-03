@@ -6,11 +6,8 @@
 # Ignore all .h5 and .out output files 
 *.h5
 *.out
-# Except energy group .h5 files
-!cas70.h5
-!cas25.h5
-!cas14.h5
-!cas8.h5
+# Except everything in the data folder
+!**/data/*
 # Ignore distribution binaries
 dist
 
