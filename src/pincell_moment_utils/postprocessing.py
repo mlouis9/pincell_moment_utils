@@ -353,14 +353,14 @@ class SurfaceExpansion:
         for surface in range(4):
             spatial_bounds = config.SPATIAL_BOUNDS
             angular_bounds = config.ANGULAR_BOUNDS
-            energy_bounds = self._get_energy_bounds()
+            energy_bounds = self.energy_bounds
             domain = [
                 (bounds[0], bounds[1])
                 for bounds in [spatial_bounds[surface], angular_bounds[surface], energy_bounds[surface]]
             ]
             samples.append(
-                rejection_sampling_3d_parallel(
-                    self.flux_functions[surface],
+                self.rejection_sampling_3d_parallel(
+                    surface,
                     domain,
                     N_surface[surface],
                     num_cores
@@ -405,11 +405,79 @@ class SurfaceExpansion:
                 flux[:, :, k] += coef * basis_cache[(i, j, vector_index)]
 
         return np.maximum(flux, 0) # To avoid returning nonphysical negative values
+    
 
+    def rejection_sampling_3d_parallel(
+        self,
+        surface: int,
+        domain: List[List[float]],
+        num_samples: int,
+        num_workers: int = None
+    ) -> np.ndarray:
+        """
+        Perform parallel rejection sampling for a 3-variable probability distribution.
+        """
+        # Extract bounds from the domain
+        x_bounds, y_bounds, z_bounds = domain
+        x_min, x_max = x_bounds
+        y_min, y_max = y_bounds
+        z_min, z_max = z_bounds
 
-def _identity_constructor(f):
-    """Simple identity constructor for PDF functions"""
-    return f
+        # Compute the volume of the domain
+        domain_volume = (x_max - x_min) * (y_max - y_min) * (z_max - z_min)
+        proposal_pdf_value = 1 / domain_volume
+
+        # Estimate the maximum value of the target PDF
+        # You might need to adjust this depending on your specific PDF
+        # Could use a grid search, optimization, or analytical maximum if known
+        M = self.estimate_max_value(surface, domain)
+
+        if num_workers is None:
+            num_workers = multiprocessing.cpu_count()
+
+        samples_per_worker = [num_samples // num_workers] * num_workers
+        for i in range(num_samples % num_workers):
+            samples_per_worker[i] += 1
+
+        target_pdf = self.flux_functions[surface]
+
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = [
+                executor.submit(
+                    rejection_sampling_worker,
+                    x_bounds,
+                    y_bounds,
+                    z_bounds,
+                    proposal_pdf_value,
+                    n,
+                    target_pdf,
+                    M,
+                )
+                for n in samples_per_worker
+            ]
+
+            results = [future.result() for future in futures]
+
+        all_samples = [sample for result in results for sample in result]
+        return np.array(all_samples)
+
+    def estimate_max_value(self, surface, domain: List[List[float]], 
+                        grid_points: int = 20) -> float:
+        """
+        Estimate the maximum value of the PDF over its domain using a grid search.
+        A more sophisticated method might be needed depending on the PDF.
+        """
+        x_bounds, y_bounds, z_bounds = domain
+        x = np.linspace(x_bounds[0], x_bounds[1], grid_points)
+        y = np.linspace(y_bounds[0], y_bounds[1], grid_points)
+        z = np.linspace(z_bounds[0], z_bounds[1], grid_points)
+        
+        pdf_vals = self.evaluate_on_grid(surface, [x, y, z])
+        max_val = np.max(pdf_vals)
+        
+        # Add safety factor to ensure we don't miss the true maximum
+        return max_val * 1.1  # 10% safety margin
+
 
 def _basis_function(i: int, j: int, vector_index: int, surface: int) -> Callable[[float, float], float]:
     """Gets the vector_index index of the ith spatial and jth angular basis function on the given surface"""
@@ -512,72 +580,3 @@ def rejection_sampling_worker(
             local_samples.append(candidate)
 
     return local_samples
-
-def rejection_sampling_3d_parallel(
-    target_pdf: Callable[[float, float, float], float],
-    domain: List[List[float]],
-    num_samples: int,
-    num_workers: int = None
-) -> np.ndarray:
-    """
-    Perform parallel rejection sampling for a 3-variable probability distribution.
-    """
-    # Extract bounds from the domain
-    x_bounds, y_bounds, z_bounds = domain
-    x_min, x_max = x_bounds
-    y_min, y_max = y_bounds
-    z_min, z_max = z_bounds
-
-    # Compute the volume of the domain
-    domain_volume = (x_max - x_min) * (y_max - y_min) * (z_max - z_min)
-    proposal_pdf_value = 1 / domain_volume
-
-    # Estimate the maximum value of the target PDF
-    # You might need to adjust this depending on your specific PDF
-    # Could use a grid search, optimization, or analytical maximum if known
-    M = estimate_max_value(target_pdf, domain)
-
-    if num_workers is None:
-        num_workers = multiprocessing.cpu_count()
-
-    samples_per_worker = [num_samples // num_workers] * num_workers
-    for i in range(num_samples % num_workers):
-        samples_per_worker[i] += 1
-
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = [
-            executor.submit(
-                rejection_sampling_worker,
-                x_bounds,
-                y_bounds,
-                z_bounds,
-                proposal_pdf_value,
-                n,
-                target_pdf,
-                M,
-            )
-            for n in samples_per_worker
-        ]
-
-        results = [future.result() for future in futures]
-
-    all_samples = [sample for result in results for sample in result]
-    return np.array(all_samples)
-
-def estimate_max_value(pdf: Callable[[float, float, float], float], domain: List[List[float]], 
-                      grid_points: int = 20) -> float:
-    """
-    Estimate the maximum value of the PDF over its domain using a grid search.
-    A more sophisticated method might be needed depending on the PDF.
-    """
-    x_bounds, y_bounds, z_bounds = domain
-    x = np.linspace(x_bounds[0], x_bounds[1], grid_points)
-    y = np.linspace(y_bounds[0], y_bounds[1], grid_points)
-    z = np.linspace(z_bounds[0], z_bounds[1], grid_points)
-    
-    max_val = 0
-    for xi, yi, zi in itertools.product(x, y, z):
-        max_val = max(max_val, pdf(xi, yi, zi))
-    
-    # Add safety factor to ensure we don't miss the true maximum
-    return max_val * 1.1  # 10% safety margin
