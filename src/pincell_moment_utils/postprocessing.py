@@ -45,6 +45,8 @@ import numpy as np
 from scipy.special import legendre
 from scipy.integrate import simpson, quad
 import itertools
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
 
 pitch = config.PITCH
 TRANSFORM_FUNCTIONS = config.TRANSFORM_FUNCTIONS
@@ -221,6 +223,51 @@ def _precompute_basis_functions(space_vals: np.ndarray, angle_vals: np.ndarray, 
     return basis_cache
 
 
+class ReconstructedFlux:
+    """Callable class to represent the reconstructed flux function for a given surface."""
+
+    def __init__(self, coefficients, energy_filters, I, J, surface):
+        """
+        Initialize the reconstructed flux function.
+
+        Parameters:
+            coefficients : np.ndarray
+                The coefficients of the functional expansion.
+            energy_filters : list
+                The energy filters for the given surface.
+            I : int
+                Spatial expansion max index.
+            J : int
+                Angular expansion max index.
+            surface : int
+                The surface index.
+        """
+        self.coefficients = coefficients
+        self.energy_filters = energy_filters
+        self.I = I
+        self.J = J
+        self.surface = surface
+
+    def __call__(self, y, ω, E):
+        """Evaluate the reconstructed flux at a given spatial (y), angular (ω), and energy (E) point."""
+        # Determine the energy index for the given E
+        E_idx = 0
+        for bin_idx, bin in enumerate(self.energy_filters[self.surface].bins):
+            if bin[0] <= E <= bin[1]:
+                E_idx = bin_idx
+
+        flux = 0
+        # Loop through the basis function indices
+        for i, j, vector_index in itertools.product(range(self.I), range(self.J), range(2)):
+            flux += (
+                self.coefficients[self.surface, i, j, E_idx, vector_index]
+                * _basis_function(i, j, vector_index, self.surface)(y, ω)
+            )
+
+        # Return the flux value, ensuring it is non-negative
+        return np.maximum(flux, 0)
+
+
 class SurfaceExpansion:
     """Used for creating and evaluating the functional expansion of the surface flux from a given set of moments/coefficients"""
     energy_filters: list
@@ -287,33 +334,42 @@ class SurfaceExpansion:
 
         return integral
     
-    def generate_samples(self, N: int):
-        """Generate N samples from the flux functions across all surfaces in accordance with their relative norms"""
-
+    def generate_samples(self, N: int, num_cores: int = multiprocessing.cpu_count()):
+        """Generate N samples from the flux functions across all surfaces in accordance with their relative norms."""
         samples = []
 
-        # First generate the normalization factors for the PDF over all surfaces
+        # Compute the normalization factors for the PDF over all surfaces
         norm_consts = np.zeros(4)
         for surface in range(4):
             norm_consts[surface] = self.integrate_flux(surface)
 
-        # Now normalize each of the individual surface flux functions by their respective norms
+        # Normalize each of the individual surface flux functions by their respective norms
         self.normalize_by(norm_consts)
 
-        # Compute the number of samples to generate from each surface. Fix rounding via surface 4
-        N_surface = np.floor(N * norm_consts/np.sum(norm_consts)).astype(int)
-        N_surface[3] += N - np.sum(N_surface) # Ensures that the total number of samples is N
+        # Compute the number of samples to generate from each surface
+        N_surface = np.floor(N * norm_consts / np.sum(norm_consts)).astype(int)
+        N_surface[3] += N - np.sum(N_surface)  # Ensure the total number of samples is N
 
         for surface in range(4):
             spatial_bounds = config.SPATIAL_BOUNDS
             angular_bounds = config.ANGULAR_BOUNDS
             energy_bounds = self._get_energy_bounds()
-            domain = [(bounds[0], bounds[1]) for bounds in [spatial_bounds[surface], angular_bounds[surface], energy_bounds[surface]]]
-            samples.append(rejection_sampling_3d(self.flux_functions[surface], domain, N_surface[surface]))
+            domain = [
+                (bounds[0], bounds[1])
+                for bounds in [spatial_bounds[surface], angular_bounds[surface], energy_bounds[surface]]
+            ]
+            samples.append(
+                rejection_sampling_3d_parallel(
+                    self.flux_functions[surface],
+                    domain,
+                    N_surface[surface],
+                    num_cores
+                )
+            )
 
         # Undo the surface normalization
-        self.normalize_by(1/norm_consts)
-    
+        self.normalize_by(1 / norm_consts)
+
         return samples
 
     def _get_energy_bounds(self) -> List[List[float]]:
@@ -321,22 +377,15 @@ class SurfaceExpansion:
         energy_bounds = [ [ self.energy_filters[surface].bins[0,0], self.energy_filters[surface].bins[-1,1] ] for surface in range(4) ]
         return energy_bounds
 
-    def _construct_surface_expansion(self, surface: int) -> Callable[[float, float, float], float]:
-        """Used for constructing the surface expansion of the flux from the bsis functions"""
-        
-        def reconstructed_flux(y, ω, E):
-            E_idx = 0
-            for bin_idx, bin in enumerate(self.energy_filters[surface].bins):
-                if bin[0] <= E <= bin[1]:
-                    E_idx = bin_idx
-
-            flux = 0
-            for i, j, vector_index in itertools.product(range(self.I), range(self.J), range(2)):
-                flux += self.coefficients[surface, i, j, E_idx, vector_index]*_basis_function(i, j, vector_index, surface)(y, ω)
-
-            return np.max(flux, 0) # To eliminate unphysical negative values
-        
-        return reconstructed_flux
+    def _construct_surface_expansion(self, surface: int) -> ReconstructedFlux:
+        """Construct the surface expansion of the flux from the basis functions."""
+        return ReconstructedFlux(
+            coefficients=self.coefficients,
+            energy_filters=self.energy_filters,
+            I=self.I,
+            J=self.J,
+            surface=surface
+        )
 
     def evaluate_on_grid(self, surface: int, grid_points: np.ndarray):
         """Evaluate the flux on a grid of spatial, angular, and energy points"""
@@ -357,6 +406,10 @@ class SurfaceExpansion:
 
         return np.maximum(flux, 0) # To avoid returning nonphysical negative values
 
+
+def _identity_constructor(f):
+    """Simple identity constructor for PDF functions"""
+    return f
 
 def _basis_function(i: int, j: int, vector_index: int, surface: int) -> Callable[[float, float], float]:
     """Gets the vector_index index of the ith spatial and jth angular basis function on the given surface"""
@@ -418,20 +471,56 @@ def _integral_basis_function(i: int, j: int, vector_index: int, surface: int) ->
     return basis
 
 
-def rejection_sampling_3d(target_pdf: Callable[[float, float, float], float], domain: List[List[float]], num_samples: int) -> np.ndarray:
+def rejection_sampling_worker(
+    x_bounds: List[float],
+    y_bounds: List[float],
+    z_bounds: List[float],
+    proposal_pdf_value: float,
+    num_samples: int,
+    target_pdf: Callable[[float, float, float], float],
+    M: float,  # Added scaling factor
+):
     """
-    Perform rejection sampling for a 3-variable probability distribution.
-
+    Worker function for generating samples using rejection sampling.
+    
     Parameters:
-        target_pdf
-            The normalized target PDF function, target_pdf(x), where x is a 3D point.
-        domain
-            A list of tuples [(x_min, x_max), (y_min, y_max), (z_min, z_max)] defining the 3D domain.
-        num_samples
-            The number of samples to generate.
+        x_bounds: The bounds for the x-dimension.
+        y_bounds: The bounds for the y-dimension.
+        z_bounds: The bounds for the z-dimension.
+        proposal_pdf_value: The proposal PDF value (uniform over the domain).
+        num_samples: The number of samples to generate.
+        target_pdf: The target PDF function.
+        M: Scaling factor ensuring M*g(x) ≥ f(x)
+    """
+    x_min, x_max = x_bounds
+    y_min, y_max = y_bounds
+    z_min, z_max = z_bounds
 
-    Returns:
-        An array of shape (num_samples, 3) containing the generated samples.
+    local_samples = []
+    while len(local_samples) < num_samples:
+        # Sample a candidate point from the uniform proposal
+        x = np.random.uniform(x_min, x_max)
+        y = np.random.uniform(y_min, y_max)
+        z = np.random.uniform(z_min, z_max)
+        candidate = np.array([x, y, z])
+
+        # Generate a uniform random number in [0, 1]
+        u = np.random.uniform(0, 1)
+
+        # Correct acceptance criterion
+        if u < target_pdf(*candidate) / (M * proposal_pdf_value):
+            local_samples.append(candidate)
+
+    return local_samples
+
+def rejection_sampling_3d_parallel(
+    target_pdf: Callable[[float, float, float], float],
+    domain: List[List[float]],
+    num_samples: int,
+    num_workers: int = None
+) -> np.ndarray:
+    """
+    Perform parallel rejection sampling for a 3-variable probability distribution.
     """
     # Extract bounds from the domain
     x_bounds, y_bounds, z_bounds = domain
@@ -439,31 +528,56 @@ def rejection_sampling_3d(target_pdf: Callable[[float, float, float], float], do
     y_min, y_max = y_bounds
     z_min, z_max = z_bounds
 
-    # Compute the volume of the domain (for the uniform proposal PDF)
+    # Compute the volume of the domain
     domain_volume = (x_max - x_min) * (y_max - y_min) * (z_max - z_min)
-
-    # Uniform proposal PDF value (constant across the domain)
     proposal_pdf_value = 1 / domain_volume
 
-    # Function to uniformly sample a point within the defined domain
-    def sample_from_domain():
-        x = np.random.uniform(x_min, x_max)
-        y = np.random.uniform(y_min, y_max)
-        z = np.random.uniform(z_min, z_max)
-        return np.array([x, y, z])
+    # Estimate the maximum value of the target PDF
+    # You might need to adjust this depending on your specific PDF
+    # Could use a grid search, optimization, or analytical maximum if known
+    M = estimate_max_value(target_pdf, domain)
 
-    # Perform rejection sampling
-    samples = []
-    while len(samples) < num_samples:
-        # Sample a candidate point from the uniform proposal
-        candidate = sample_from_domain()
+    if num_workers is None:
+        num_workers = multiprocessing.cpu_count()
 
-        # Generate a uniform random number in [0, 1] for acceptance check
-        u = np.random.uniform(0, 1)
+    samples_per_worker = [num_samples // num_workers] * num_workers
+    for i in range(num_samples % num_workers):
+        samples_per_worker[i] += 1
 
-        # Check acceptance criterion
-        if u < target_pdf(*candidate) / proposal_pdf_value:
-            samples.append(candidate)
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [
+            executor.submit(
+                rejection_sampling_worker,
+                x_bounds,
+                y_bounds,
+                z_bounds,
+                proposal_pdf_value,
+                n,
+                target_pdf,
+                M,
+            )
+            for n in samples_per_worker
+        ]
 
-    # Return the generated samples as a NumPy array
-    return np.array(samples)
+        results = [future.result() for future in futures]
+
+    all_samples = [sample for result in results for sample in result]
+    return np.array(all_samples)
+
+def estimate_max_value(pdf: Callable[[float, float, float], float], domain: List[List[float]], 
+                      grid_points: int = 20) -> float:
+    """
+    Estimate the maximum value of the PDF over its domain using a grid search.
+    A more sophisticated method might be needed depending on the PDF.
+    """
+    x_bounds, y_bounds, z_bounds = domain
+    x = np.linspace(x_bounds[0], x_bounds[1], grid_points)
+    y = np.linspace(y_bounds[0], y_bounds[1], grid_points)
+    z = np.linspace(z_bounds[0], z_bounds[1], grid_points)
+    
+    max_val = 0
+    for xi, yi, zi in itertools.product(x, y, z):
+        max_val = max(max_val, pdf(xi, yi, zi))
+    
+    # Add safety factor to ensure we don't miss the true maximum
+    return max_val * 1.1  # 10% safety margin
