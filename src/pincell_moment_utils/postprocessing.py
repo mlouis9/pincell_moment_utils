@@ -47,6 +47,7 @@ from scipy.integrate import simpson, quad
 import itertools
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
+import scipy
 
 pitch = config.PITCH
 TRANSFORM_FUNCTIONS = config.TRANSFORM_FUNCTIONS
@@ -419,18 +420,12 @@ class SurfaceExpansion:
         """
         # Extract bounds from the domain
         x_bounds, y_bounds, z_bounds = domain
-        x_min, x_max = x_bounds
-        y_min, y_max = y_bounds
-        z_min, z_max = z_bounds
 
-        # Compute the volume of the domain
-        domain_volume = (x_max - x_min) * (y_max - y_min) * (z_max - z_min)
-        proposal_pdf_value = 1 / domain_volume
+        target_pdf = self.flux_functions[surface]
 
         # Estimate the maximum value of the target PDF
-        # You might need to adjust this depending on your specific PDF
-        # Could use a grid search, optimization, or analytical maximum if known
-        M = self.estimate_max_value(surface, domain)
+        M = self._estimate_M(domain, target_pdf)
+        print(M)
 
         if num_workers is None:
             num_workers = multiprocessing.cpu_count()
@@ -439,8 +434,6 @@ class SurfaceExpansion:
         for i in range(num_samples % num_workers):
             samples_per_worker[i] += 1
 
-        target_pdf = self.flux_functions[surface]
-
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
             futures = [
                 executor.submit(
@@ -448,7 +441,6 @@ class SurfaceExpansion:
                     x_bounds,
                     y_bounds,
                     z_bounds,
-                    proposal_pdf_value,
                     n,
                     target_pdf,
                     M,
@@ -460,6 +452,27 @@ class SurfaceExpansion:
 
         all_samples = [sample for result in results for sample in result]
         return np.array(all_samples)
+    
+    def _estimate_M(self, domain, target_pdf, num_trials=1000):
+        x_bounds, y_bounds, z_bounds = domain
+        x_min, x_max = x_bounds
+        y_min, y_max = y_bounds
+        z_min, z_max = z_bounds
+
+        ratios = []
+        for _ in range(num_trials):
+            x = np.random.uniform(x_min, x_max)
+            y = np.random.uniform(y_min, y_max)
+            z = np.exp(np.random.uniform(np.log(z_min), np.log(z_max)))  # Correct log-uniform sampling
+
+            proposal_pdf_value = (1 / ((x_max - x_min) * (y_max - y_min))) * (1 / (z * np.log(z_max / z_min)))
+            ratio = target_pdf(x, y, z) / proposal_pdf_value if proposal_pdf_value > 0 else 0
+
+            ratios.append(ratio)
+        
+        max_ratio = np.max(np.array(ratios))
+
+        return max_ratio * 1.1  # Add a safety margin
 
     def estimate_max_value(self, surface, domain: List[List[float]], 
                         grid_points: int = 20) -> float:
@@ -543,7 +556,6 @@ def rejection_sampling_worker(
     x_bounds: List[float],
     y_bounds: List[float],
     z_bounds: List[float],
-    proposal_pdf_value: float,
     num_samples: int,
     target_pdf: Callable[[float, float, float], float],
     M: float,  # Added scaling factor
@@ -558,7 +570,7 @@ def rejection_sampling_worker(
         proposal_pdf_value: The proposal PDF value (uniform over the domain).
         num_samples: The number of samples to generate.
         target_pdf: The target PDF function.
-        M: Scaling factor ensuring M*g(x) ≥ f(x)
+        M: The estimated maximum value of f(x) such that f(x) ≤ M g(x)
     """
     x_min, x_max = x_bounds
     y_min, y_max = y_bounds
@@ -566,17 +578,19 @@ def rejection_sampling_worker(
 
     local_samples = []
     while len(local_samples) < num_samples:
-        # Sample a candidate point from the uniform proposal
+        # Sample a candidate point from the uniform p
         x = np.random.uniform(x_min, x_max)
         y = np.random.uniform(y_min, y_max)
-        z = np.random.uniform(z_min, z_max)
+        z = np.exp(np.random.uniform(np.log(z_min), np.log(z_max)))
         candidate = np.array([x, y, z])
+
+        proposal_pdf_value = (1 / ((x_max - x_min) * (y_max - y_min))) * (1 / (z * np.log(z_max / z_min)))
 
         # Generate a uniform random number in [0, 1]
         u = np.random.uniform(0, 1)
 
-        # Correct acceptance criterion
-        if u < target_pdf(*candidate) / (M * proposal_pdf_value):
+        # Acceptance criterion
+        if u < target_pdf(*candidate) / ( M * proposal_pdf_value):
             local_samples.append(candidate)
 
     return local_samples
