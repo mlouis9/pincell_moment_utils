@@ -439,7 +439,8 @@ class SurfaceExpansion:
         N: int,
         num_cores: int = multiprocessing.cpu_count(),
         method: str = 'metropolis_hastings',
-        use_log_energy: bool = False
+        use_log_energy: bool = False,
+        burn_in: int = 1000
     ):
         """
         Generate N samples from the flux functions across all surfaces.
@@ -454,6 +455,8 @@ class SurfaceExpansion:
             'rejection', 'ensemble', or 'metropolis_hastings'
         use_log_energy : bool
             If True, sample in log(E)-space with Jacobian. If False, sample in E-space.
+        burn_in
+            The number of burn in steps to use if method is 'metropolis_hastings' or 'ensemble'
         """
         samples = []
 
@@ -498,10 +501,10 @@ class SurfaceExpansion:
             elif method == 'ensemble':
                 if not use_log_energy:
                     # old ensemble in linear space
-                    out = self.ensemble(surface, domain, n_samps, num_cores=num_cores)
+                    out = self.ensemble(surface, domain, n_samps, num_cores=num_cores, burn_in=burn_in)
                 else:
                     # new ensemble in logE
-                    out = self.ensemble_logE(surface, domain, n_samps, num_cores=num_cores)
+                    out = self.ensemble_logE(surface, domain, n_samps, num_cores=num_cores, burn_in=burn_in)
                 samples.append(out)
 
             elif method == 'metropolis_hastings':
@@ -871,7 +874,7 @@ class SurfaceExpansion:
         target_pdf = self.flux_functions[surface]
 
         # Estimate bounding constant M with uniform sampling
-        M = self._estimate_M_uniform(domain, target_pdf, num_trials=50000)
+        M = self._estimate_M_uniform(surface, domain)
 
         if num_workers is None:
             num_workers = multiprocessing.cpu_count()
@@ -900,7 +903,7 @@ class SurfaceExpansion:
         return all_samples
     
     
-    def _estimate_M_uniform(self, domain, target_pdf, num_trials=50000):
+    def _estimate_M_uniform(self, surface, domain, num_points=40):
         """
         Estimate bounding constant M by sampling points uniformly in (x,y,E).
         """
@@ -908,17 +911,17 @@ class SurfaceExpansion:
         y_min, y_max = domain[1]
         e_min, e_max = domain[2]
 
-        samples_x = np.random.uniform(x_min, x_max, num_trials)
-        samples_y = np.random.uniform(y_min, y_max, num_trials)
-        samples_e = np.random.uniform(e_min, e_max, num_trials)
+        samples_x = np.random.uniform(x_min, x_max, num_points)
+        samples_y = np.random.uniform(y_min, y_max, num_points)
+        samples_e = np.exp(np.random.uniform(np.log(e_min), np.log(e_max), num_points))
 
         # Evaluate target flux and proposal pdf
         # proposal_pdf_value = 1 / ((x_max - x_min)*(y_max - y_min)*(e_max - e_min))
         # We'll compute ratio = flux / proposal_pdf_value
-        proposal_pdf_val = 1.0 / ((x_max - x_min)*(y_max - y_min)*(e_max - e_min))
+        proposal_pdf_vals = 1.0 / ((x_max - x_min)*(y_max - y_min)) * 1/(samples_e * np.log(e_max/e_min))
 
-        flux_vals = target_pdf(samples_x, samples_y, samples_e)
-        ratios = flux_vals / proposal_pdf_val
+        flux_vals = self.evaluate_on_grid(surface, [samples_x, samples_y, samples_e])
+        ratios = flux_vals / proposal_pdf_vals[np.newaxis, np.newaxis, :]
 
         # Return a slightly padded max
         return np.max(ratios) * 1.1
@@ -1019,19 +1022,15 @@ def _rejection_sampling_worker_uniform(
     y_min, y_max = y_bounds
     e_min, e_max = e_bounds
 
-    proposal_pdf_val = 1.0 / ((x_max - x_min)*(y_max - y_min)*(e_max - e_min))
-
     local_samples = []
     while len(local_samples) < num_samples:
         # Sample uniformly
         x = np.random.uniform(x_min, x_max)
         y = np.random.uniform(y_min, y_max)
-        e = np.random.uniform(e_min, e_max)
+        e = np.exp(np.random.uniform(np.log(e_min), np.log(e_max)))
 
         fx = target_pdf(x, y, e)
-        if fx <= 0:
-            # Rejected
-            continue
+        proposal_pdf_val = 1.0 / ((x_max - x_min)*(y_max - y_min)) * 1/(e *np.log(e_max/e_min))
 
         # Acceptance test
         if np.random.rand() < fx / (M * proposal_pdf_val):
