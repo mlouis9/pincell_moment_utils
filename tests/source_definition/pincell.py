@@ -145,45 +145,13 @@ plt.savefig('geometry.png', dpi=500)
 
 #==========
 # Settings
-#==========
-
-# ---------------------
-# Incident Flux Source
-# ---------------------
-# Currently defining via openmc stats distributions, but will be supplied by a file in the final version
-boundary_offset = 1e-4  # Slight inward shift to avoid exact boundaries
-
-# Adjust px, mx, py, my distributions
-px_dist = openmc.stats.Discrete([pitch/2 - boundary_offset], [1.0])
-mx_dist = openmc.stats.Discrete([-pitch/2 + boundary_offset], [1.0])
-py_dist = openmc.stats.Discrete([pitch/2 - boundary_offset], [1.0])
-my_dist = openmc.stats.Discrete([-pitch/2 + boundary_offset], [1.0])
-
-x_dist = openmc.stats.Normal(0, 0.3)
-y_dist = openmc.stats.Normal(0, 0.3)
-z_dist = openmc.stats.Discrete([0.0], [1.0])  # z fixed at 0
-
-energy_dist = openmc.stats.Discrete([0.0253], [1.0])
-
-angle_distpx = openmc.stats.Monodirectional((1.0, 0.0, 0.0))
-angle_distmx = openmc.stats.Monodirectional((-1.0, 0.0, 0.0))
-angle_distpy = openmc.stats.Monodirectional((0.0, 1.0, 0.0))
-angle_distmy = openmc.stats.Monodirectional((0.0, -1.0, 0.0))
-
-spatial_distpx = openmc.stats.CartesianIndependent(px_dist, y_dist, z_dist)
-spatial_distmx = openmc.stats.CartesianIndependent(mx_dist, y_dist, z_dist)
-spatial_distpy = openmc.stats.CartesianIndependent(x_dist, py_dist, z_dist)
-spatial_distmy = openmc.stats.CartesianIndependent(x_dist, my_dist, z_dist)
-src_px = openmc.Source(space=spatial_distpx, angle=angle_distmx, energy=energy_dist)
-src_mx = openmc.Source(space=spatial_distmx, angle=angle_distpx, energy=energy_dist)
-src_py = openmc.Source(space=spatial_distpy, angle=angle_distmy, energy=energy_dist)
-src_my = openmc.Source(space=spatial_distmy, angle=angle_distpy, energy=energy_dist)
+#=========
 
 # ------------------
 # Particle Settings
 # ------------------
 settings = openmc.Settings()
-settings.source = [src_px, src_mx, src_py, src_my]
+settings.source = openmc.FileSource('incident_flux.h5')
 settings.batches = 100
 settings.inactive = 20
 settings.particles = 100000
@@ -220,7 +188,7 @@ dimensions = [[1, N], [1, N], [N, 1], [N, 1]]
 lower_lefts = [[pitch/2, -pitch/2], [-3/4*pitch, -pitch/2], [-pitch/2, pitch/2], [-pitch/2, -3/4*pitch]]
 upper_rights = [[3/4*pitch, pitch/2], [-pitch/2, pitch/2], [pitch/2, 3/4*pitch], [pitch/2, -pitch/2]]
 for surface in range(4):
-    mesh = openmc.Mesh()
+    mesh = openmc.RegularMesh()
     mesh.dimension = dimensions[surface]  # 1 bin in x, 20 bins in y
     mesh.lower_left = lower_lefts[surface]  # Narrow region near the right boundary
     mesh.upper_right = upper_rights[surface]  # Extend over the y range
