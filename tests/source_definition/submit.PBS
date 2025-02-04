@@ -1,0 +1,15 @@
+#!/bin/bash
+#PBS -l nodes=1:ppn=48
+#PBS -N openmc_sampling
+#PBS -l walltime=8:00:00
+#PBS -j oe
+#PBS -P edu_res
+
+cat $PBS_NODEFILE
+
+module load openmc
+
+cd $PBS_O_WORKDIR
+
+export OMP_NUM_THREADS=48
+python source.py

@@ -2,8 +2,9 @@ from pincell_moment_utils import postprocessing as pp
 from pincell_moment_utils import config
 import openmc
 import numpy as np
+import multiprocessing
 
-N_samples = 1E+03
+N_samples = 1E+07
 
 # First extract the surface fluxes from the tallies, then use them to compute the moments of the expansion 
 mesh_tally = pp.SurfaceMeshTally('../data/source_statepoint.100.h5')
@@ -13,7 +14,7 @@ expansion = pp.SurfaceExpansion(coefficients, mesh_tally.energy_filters)
 space_vals, angle_vals, energy_vals = mesh_tally.meshes[0]
 expansion_vals = expansion.evaluate_on_grid(0, (space_vals, angle_vals, energy_vals))
 
-samples = expansion.generate_samples(N_samples, num_cores=8, burn_in=100, progress=True)
+samples = expansion.generate_samples(N_samples, num_cores=multiprocessing.cpu_count(), burn_in=1000, progress=True)
 
 pitch = config.PITCH
 surface_perpendicular_coordinate = [pitch/2, -pitch/2, pitch/2, -pitch/2]
