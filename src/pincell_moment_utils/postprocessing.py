@@ -47,7 +47,7 @@ from scipy.integrate import simpson, quad
 import itertools
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
-import scipy
+import emcee
 
 pitch = config.PITCH
 TRANSFORM_FUNCTIONS = config.TRANSFORM_FUNCTIONS
@@ -223,6 +223,40 @@ def _precompute_basis_functions(space_vals: np.ndarray, angle_vals: np.ndarray, 
     
     return basis_cache
 
+def _global_log_prob(theta, pdf, domain):
+    """
+    A top-level log-prob function that can be pickled for multiprocessing.
+    
+    Parameters
+    ----------
+    theta : array_like
+        A 3-element array [x, y, E].
+    pdf : callable
+        The flux function for a given surface, e.g. ReconstructedFlux.
+    domain : list of 3 tuples
+        [(x_min, x_max), (y_min, y_max), (E_min, E_max)].
+        
+    Returns
+    -------
+    float
+        The log of the PDF (log(flux)), or -np.inf if out-of-bounds or flux<=0.
+    """
+    x, y, E = theta
+    (x_min, x_max), (y_min, y_max), (e_min, e_max) = domain
+
+    # Domain checks
+    if not (x_min <= x <= x_max):
+        return -np.inf
+    if not (y_min <= y <= y_max):
+        return -np.inf
+    if not (e_min <= E <= e_max):
+        return -np.inf
+    
+    val = pdf(x, y, E)
+    if val <= 0:
+        return -np.inf
+    return np.log(val)
+
 
 class ReconstructedFlux:
     """Callable class to represent the reconstructed flux function for a given surface."""
@@ -293,25 +327,6 @@ class SurfaceExpansion:
         self.energy_bounds = self._get_energy_bounds()
         self.flux_functions = [self._construct_surface_expansion(surface) for surface in range(4) ]
 
-    def normalize_by(self, normalization_const: Union[float, List[float]]) -> None:
-        """Normalize all surface flux functions by a global normalization constant, or normalize each surface by an individual normalization
-        constant
-        
-        Parameters
-        ----------
-        normalization_const
-            Either a single global normalization constant for all surfaces, or a list of normalization constants for each surface"""
-        if isinstance(normalization_const, float):
-            self.coefficients = self.coefficients/normalization_const
-        elif isinstance(normalization_const, list) or isinstance(normalization_const, np.ndarray):
-            for surface in range(4):
-                self.coefficients[surface, :, :, :, :] /= normalization_const[surface]
-        else:
-            raise ValueError(f"Normalization constant can only be of type float or list, you supplied type {type(normalization_const)}")
-        
-        # Now reconstruct the flux functions with these normalized coefficients
-        self.flux_functions = [self._construct_surface_expansion(surface) for surface in range(4) ]
-
     def integrate_flux(self, surface: int) -> float:
         """Compute the integral of the surface flux (over the relevant surface phase space)."""
         spatial_bounds = SPATIAL_BOUNDS[surface]
@@ -335,43 +350,24 @@ class SurfaceExpansion:
 
         return integral
     
-    def generate_samples(self, N: int, num_cores: int = multiprocessing.cpu_count()):
-        """Generate N samples from the flux functions across all surfaces in accordance with their relative norms."""
-        samples = []
-
-        # Compute the normalization factors for the PDF over all surfaces
-        norm_consts = np.zeros(4)
-        for surface in range(4):
-            norm_consts[surface] = self.integrate_flux(surface)
-
-        # Normalize each of the individual surface flux functions by their respective norms
-        self.normalize_by(norm_consts)
-
-        # Compute the number of samples to generate from each surface
-        N_surface = np.floor(N * norm_consts / np.sum(norm_consts)).astype(int)
-        N_surface[3] += N - np.sum(N_surface)  # Ensure the total number of samples is N
-
-        for surface in range(4):
-            spatial_bounds = config.SPATIAL_BOUNDS
-            angular_bounds = config.ANGULAR_BOUNDS
-            energy_bounds = self.energy_bounds
-            domain = [
-                (bounds[0], bounds[1])
-                for bounds in [spatial_bounds[surface], angular_bounds[surface], energy_bounds[surface]]
-            ]
-            samples.append(
-                self.rejection_sampling_3d_parallel(
-                    surface,
-                    domain,
-                    N_surface[surface],
-                    num_cores
-                )
-            )
-
-        # Undo the surface normalization
-        self.normalize_by(1 / norm_consts)
-
-        return samples
+    def normalize_by(self, normalization_const: Union[float, List[float]]) -> None:
+        """Normalize all surface flux functions by a global normalization constant, or normalize each surface by an individual normalization
+        constant
+        
+        Parameters
+        ----------
+        normalization_const
+            Either a single global normalization constant for all surfaces, or a list of normalization constants for each surface"""
+        if isinstance(normalization_const, float):
+            self.coefficients = self.coefficients/normalization_const
+        elif isinstance(normalization_const, list) or isinstance(normalization_const, np.ndarray):
+            for surface in range(4):
+                self.coefficients[surface, :, :, :, :] /= normalization_const[surface]
+        else:
+            raise ValueError(f"Normalization constant can only be of type float or list, you supplied type {type(normalization_const)}")
+        
+        # Now reconstruct the flux functions with these normalized coefficients
+        self.flux_functions = [self._construct_surface_expansion(surface) for surface in range(4) ]
 
     def _get_energy_bounds(self) -> List[List[float]]:
         """Returns a list of energy bounds for each surface"""
@@ -407,6 +403,239 @@ class SurfaceExpansion:
 
         return np.maximum(flux, 0) # To avoid returning nonphysical negative values
     
+    def generate_samples(self, N: int, num_cores: int = multiprocessing.cpu_count(), method: str='metropolis_hastings'):
+        """Generate N samples from the flux functions across all surfaces in accordance with their relative norms.
+        
+        Parameters
+        ----------
+        N
+            The number of samles to generate
+        num_cores
+            The number of cores to use when generating samples in parallel
+        method
+            The method to use for generating samples: either 'rejection', 'ensemble', or 'metropolis_hastings'
+        """
+        samples = []
+
+        # Compute the normalization factors for the PDF over all surfaces
+        norm_consts = np.zeros(4)
+        for surface in range(4):
+            norm_consts[surface] = self.integrate_flux(surface)
+
+        # Normalize each of the individual surface flux functions by their respective norms
+        self.normalize_by(norm_consts)
+
+        # Compute the number of samples to generate from each surface
+        N_surface = np.floor(N * norm_consts / np.sum(norm_consts)).astype(int)
+        N_surface[3] += N - np.sum(N_surface)  # Ensure the total number of samples is N
+
+        for surface in range(4):
+            spatial_bounds = config.SPATIAL_BOUNDS
+            angular_bounds = config.ANGULAR_BOUNDS
+            energy_bounds = self.energy_bounds
+            domain = [
+                (bounds[0], bounds[1])
+                for bounds in [spatial_bounds[surface], angular_bounds[surface], energy_bounds[surface]]
+            ]
+            if method == 'rejection':
+                samples.append(
+                    self.rejection_sampling_3d_parallel(
+                        surface,
+                        domain,
+                        N_surface[surface],
+                        num_cores
+                    )
+                )
+            elif method == 'ensemble':
+                samples.append(
+                    self.ensemble(
+                        surface,
+                        domain,
+                        N_surface[surface],
+                        num_cores=num_cores
+                    )
+                )
+            elif method == 'metropolis_hastings':
+                samples.append(
+                    self.metropolis_hastings(
+                        surface,
+                        domain, 
+                        N_surface[surface]
+                    )
+                )
+            else:
+                raise ValueError("Unsupported sampling method.")
+
+        # Undo the surface normalization
+        self.normalize_by(1 / norm_consts)
+
+        return samples
+    
+    def ensemble(
+        self,
+        surface: int,
+        domain,
+        N: int,
+        nwalkers: int = 32,
+        burn_in: int = 1000,
+        num_cores: int = 1
+    ):
+        """
+        Generate samples using the emcee EnsembleSampler for the flux on a given surface.
+
+        Parameters
+        ----------
+        surface : int
+            Surface index to sample from
+        domain : list of 3 tuples [(x_min, x_max), (y_min, y_max), (E_min, E_max)]
+            Bounds for each variable.
+        N : int
+            Number of samples PER WALKER after burn-in. The total # of samples will be nwalkers * N.
+        nwalkers : int
+            Number of walkers in the ensemble.
+        burn_in : int
+            Number of burn-in steps (discarded).
+        num_cores : int
+            Number of CPU cores for parallel sampling. If <= 1, no parallelization.
+
+        Returns
+        -------
+        samples : np.ndarray
+            Shape (nwalkers*N, 3), flattened chain.
+        """
+
+        # The flux function for this surface (ReconstructedFlux object)
+        pdf = self.flux_functions[surface]
+
+        # Initialize walkers uniformly in the domain
+        p0 = []
+        for _ in range(nwalkers):
+            init_x = np.random.uniform(domain[0][0], domain[0][1])
+            init_y = np.random.uniform(domain[1][0], domain[1][1])
+            init_e = np.random.uniform(domain[2][0], domain[2][1])
+            p0.append([init_x, init_y, init_e])
+        p0 = np.array(p0)  # shape (nwalkers, 3)
+
+        # Create a multiprocessing pool if num_cores > 1
+        pool = None
+        if num_cores is not None and num_cores > 1:
+            pool = multiprocessing.Pool(processes=num_cores)
+
+        try:
+            # Pass _global_log_prob as the log-prob function
+            # and supply (pdf, domain) via args=...
+            sampler = emcee.EnsembleSampler(
+                nwalkers,
+                3,
+                _global_log_prob,    # <--- the top-level function
+                args=(pdf, domain),  # <--- pass these to log_prob
+                pool=pool
+            )
+
+            # Burn-in
+            state = sampler.run_mcmc(p0, burn_in, progress=True)
+            sampler.reset()
+
+            # Production
+            sampler.run_mcmc(state, N, progress=True)
+
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
+
+        # Flatten the chain to shape (nwalkers*N, 3)
+        samples = sampler.get_chain(discard=0, thin=1, flat=True)
+        return samples
+
+    
+    def metropolis_hastings(self, surface: int, domain, N, x0=None, proposal_std=None):
+        """
+        Perform Metropolis-Hastings sampling while respecting domain constraints.
+        
+        Parameters:
+        -----------
+        surface : int
+            The surface whose flux function is being sampled
+        domain : list of tuples [(x_min, x_max), (y_min, y_max), (z_min, z_max)]
+            Bounds for each variable in the order (spatial, angle, energy).
+        N : int
+            Number of samples to generate.
+        x0 : np.ndarray, optional
+            Initial point. If None, will be randomly chosen within the domain.
+        proposal_std : np.ndarray, optional
+            Standard deviation of the Gaussian proposal distribution for each variable.
+            
+        Returns:
+        --------
+        np.ndarray
+            Array of shape (N, 3) for the accepted samples (the chain).
+        """
+
+        pdf = self.flux_functions[surface]
+        dim = len(domain)
+
+        # -- Initialize x0 if not provided --
+        if x0 is None:
+            x0 = np.array([
+                np.random.uniform(low=dom[0], high=dom[1]) for dom in domain
+            ])  # random within domain
+
+        # Make sure x0 is in the domain
+        for i in range(dim):
+            if not (domain[i][0] <= x0[i] <= domain[i][1]):
+                raise ValueError(f"Initial guess x0[{i}] = {x0[i]} is out of domain {domain[i]}")
+
+        # Evaluate pdf at current point
+        f_current = pdf(*x0)
+        # If flux is 0 or negative, that is effectively -inf in log
+        if f_current <= 0:
+            raise ValueError("Initial guess has zero or negative PDF value. Pick a better x0 within domain.")
+
+        # Define proposal standard deviations if not provided
+        if proposal_std is None:
+            proposal_std = np.array([
+                0.1 * (dom[1] - dom[0]) for dom in domain
+            ])  # e.g. 10% of domain size
+
+        samples = []
+        x_current = x0.copy()
+
+        for _ in range(N):
+            # Propose a new candidate point with Gaussian step
+            x_proposed = x_current + np.random.normal(scale=proposal_std, size=dim)
+
+            # Check if proposed point is within the domain
+            out_of_domain = any(
+                (x_proposed[i] < domain[i][0]) or (x_proposed[i] > domain[i][1])
+                for i in range(dim)
+            )
+
+            if out_of_domain:
+                # Immediately reject, keep the old sample
+                samples.append(x_current.copy())
+                continue
+
+            # Evaluate PDF at proposed
+            f_proposed = pdf(*x_proposed)
+
+            if f_proposed <= 0:
+                # Also reject
+                samples.append(x_current.copy())
+                continue
+
+            # Symmetric proposal => acceptance ratio
+            alpha = f_proposed / f_current
+            if np.random.rand() < alpha:
+                # Accept
+                x_current = x_proposed
+                f_current = f_proposed
+            # else reject => keep x_current as is
+
+            samples.append(x_current.copy())
+
+        return np.array(samples)
+
 
     def rejection_sampling_3d_parallel(
         self,
@@ -418,14 +647,11 @@ class SurfaceExpansion:
         """
         Perform parallel rejection sampling for a 3-variable probability distribution.
         """
-        # Extract bounds from the domain
-        x_bounds, y_bounds, z_bounds = domain
-
+        x_bounds, y_bounds, e_bounds = domain
         target_pdf = self.flux_functions[surface]
 
-        # Estimate the maximum value of the target PDF
-        M = self._estimate_M(domain, target_pdf)
-        print(M)
+        # Estimate bounding constant M with uniform sampling
+        M = self._estimate_M_uniform(domain, target_pdf, num_trials=50000)
 
         if num_workers is None:
             num_workers = multiprocessing.cpu_count()
@@ -437,10 +663,10 @@ class SurfaceExpansion:
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
             futures = [
                 executor.submit(
-                    rejection_sampling_worker,
+                    _rejection_sampling_worker_uniform,
                     x_bounds,
                     y_bounds,
-                    z_bounds,
+                    e_bounds,
                     n,
                     target_pdf,
                     M,
@@ -448,51 +674,57 @@ class SurfaceExpansion:
                 for n in samples_per_worker
             ]
 
-            results = [future.result() for future in futures]
+            results = [f.result() for f in futures]
 
-        all_samples = [sample for result in results for sample in result]
-        return np.array(all_samples)
+        all_samples = np.concatenate(results, axis=0)
+        return all_samples
     
-    def _estimate_M(self, domain, target_pdf, num_trials=1000):
-        x_bounds, y_bounds, z_bounds = domain
-        x_min, x_max = x_bounds
-        y_min, y_max = y_bounds
-        z_min, z_max = z_bounds
-
-        ratios = []
-        for _ in range(num_trials):
-            x = np.random.uniform(x_min, x_max)
-            y = np.random.uniform(y_min, y_max)
-            z = np.exp(np.random.uniform(np.log(z_min), np.log(z_max)))  # Correct log-uniform sampling
-
-            proposal_pdf_value = (1 / ((x_max - x_min) * (y_max - y_min))) * (1 / (z * np.log(z_max / z_min)))
-            ratio = target_pdf(x, y, z) / proposal_pdf_value if proposal_pdf_value > 0 else 0
-
-            ratios.append(ratio)
-        
-        max_ratio = np.max(np.array(ratios))
-
-        return max_ratio * 1.1  # Add a safety margin
-
-    def estimate_max_value(self, surface, domain: List[List[float]], 
-                        grid_points: int = 20) -> float:
+    
+    def _estimate_M_uniform(self, domain, target_pdf, num_trials=50000):
         """
-        Estimate the maximum value of the PDF over its domain using a grid search.
-        A more sophisticated method might be needed depending on the PDF.
+        Estimate bounding constant M by sampling points uniformly in (x,y,E).
         """
-        x_bounds, y_bounds, z_bounds = domain
-        x = np.linspace(x_bounds[0], x_bounds[1], grid_points)
-        y = np.linspace(y_bounds[0], y_bounds[1], grid_points)
-        z = np.linspace(z_bounds[0], z_bounds[1], grid_points)
+        x_min, x_max = domain[0]
+        y_min, y_max = domain[1]
+        e_min, e_max = domain[2]
+
+        samples_x = np.random.uniform(x_min, x_max, num_trials)
+        samples_y = np.random.uniform(y_min, y_max, num_trials)
+        samples_e = np.random.uniform(e_min, e_max, num_trials)
+
+        # Evaluate target flux and proposal pdf
+        # proposal_pdf_value = 1 / ((x_max - x_min)*(y_max - y_min)*(e_max - e_min))
+        # We'll compute ratio = flux / proposal_pdf_value
+        proposal_pdf_val = 1.0 / ((x_max - x_min)*(y_max - y_min)*(e_max - e_min))
+
+        flux_vals = target_pdf(samples_x, samples_y, samples_e)
+        ratios = flux_vals / proposal_pdf_val
+
+        # Return a slightly padded max
+        return np.max(ratios) * 1.1
+
+
+    def estimate_max_point(self, surface, grid_points: int = 20) -> float:
+        """
+        Estimate the location of the maximum value of the flux on a given surface
+        """
+        space_bounds = config.SPATIAL_BOUNDS[surface]
+        angle_bounds = config.ANGULAR_BOUNDS[surface]
+        energy_bounds = self.energy_bounds[surface]
+
+        space_vals = np.linspace(space_bounds[0], space_bounds[1], grid_points)
+        angle_vals = np.linspace(angle_bounds[0], angle_bounds[1], grid_points)
+        energy_vals = np.linspace(energy_bounds[0], energy_bounds[1], grid_points)
         
-        pdf_vals = self.evaluate_on_grid(surface, [x, y, z])
-        max_val = np.max(pdf_vals)
+        pdf_vals = self.evaluate_on_grid(surface, [space_vals, angle_vals, energy_vals])
+        max_point = np.argmax(pdf_vals)
+        max_point = np.unravel_index(max_point, (grid_points, grid_points, grid_points))
         
-        # Add safety factor to ensure we don't miss the true maximum
-        return max_val * 1.1  # 10% safety margin
+        return (space_vals[max_point[0]], angle_vals[max_point[1]], energy_vals[max_point[2]])
 
 
 def _basis_function(i: int, j: int, vector_index: int, surface: int) -> Callable[[float, float], float]:
+    
     """Gets the vector_index index of the ith spatial and jth angular basis function on the given surface"""
     transform_function = TRANSFORM_FUNCTIONS[surface]
     spatial_bounds = SPATIAL_BOUNDS[surface]
@@ -552,45 +784,37 @@ def _integral_basis_function(i: int, j: int, vector_index: int, surface: int) ->
     return basis
 
 
-def rejection_sampling_worker(
+def _rejection_sampling_worker_uniform(
     x_bounds: List[float],
     y_bounds: List[float],
-    z_bounds: List[float],
+    e_bounds: List[float],
     num_samples: int,
     target_pdf: Callable[[float, float, float], float],
-    M: float,  # Added scaling factor
+    M: float
 ):
     """
-    Worker function for generating samples using rejection sampling.
-    
-    Parameters:
-        x_bounds: The bounds for the x-dimension.
-        y_bounds: The bounds for the y-dimension.
-        z_bounds: The bounds for the z-dimension.
-        proposal_pdf_value: The proposal PDF value (uniform over the domain).
-        num_samples: The number of samples to generate.
-        target_pdf: The target PDF function.
-        M: The estimated maximum value of f(x) such that f(x) ≤ M g(x)
+    Worker function for generating samples using uniform-based rejection sampling.
     """
     x_min, x_max = x_bounds
     y_min, y_max = y_bounds
-    z_min, z_max = z_bounds
+    e_min, e_max = e_bounds
+
+    proposal_pdf_val = 1.0 / ((x_max - x_min)*(y_max - y_min)*(e_max - e_min))
 
     local_samples = []
     while len(local_samples) < num_samples:
-        # Sample a candidate point from the uniform p
+        # Sample uniformly
         x = np.random.uniform(x_min, x_max)
         y = np.random.uniform(y_min, y_max)
-        z = np.exp(np.random.uniform(np.log(z_min), np.log(z_max)))
-        candidate = np.array([x, y, z])
+        e = np.random.uniform(e_min, e_max)
 
-        proposal_pdf_value = (1 / ((x_max - x_min) * (y_max - y_min))) * (1 / (z * np.log(z_max / z_min)))
+        fx = target_pdf(x, y, e)
+        if fx <= 0:
+            # Rejected
+            continue
 
-        # Generate a uniform random number in [0, 1]
-        u = np.random.uniform(0, 1)
+        # Acceptance test
+        if np.random.rand() < fx / (M * proposal_pdf_val):
+            local_samples.append([x, y, e])
 
-        # Acceptance criterion
-        if u < target_pdf(*candidate) / ( M * proposal_pdf_value):
-            local_samples.append(candidate)
-
-    return local_samples
+    return np.array(local_samples)
