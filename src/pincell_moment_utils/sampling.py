@@ -202,8 +202,9 @@ def ensemble(
     pdf: Callable[[float, float, float], float],
     domain: List[List[float]],
     N: int,
-    nwalkers: int = 32,
     burn_in: int = 1000,
+    n_walkers: int = 32,
+    progress: bool = False,
     num_cores: int = 1
 ) -> np.ndarray:
     """
@@ -213,7 +214,7 @@ def ensemble(
 
     # Initialize each walker
     p0 = []
-    for _ in range(nwalkers):
+    for _ in range(n_walkers):
         x0 = np.random.uniform(x_min, x_max)
         w0 = np.random.uniform(w_min, w_max)
         e0 = np.random.uniform(e_min, e_max)
@@ -225,7 +226,7 @@ def ensemble(
         pool = multiprocessing.Pool(processes=num_cores)
 
     sampler = emcee.EnsembleSampler(
-        nwalkers,
+        n_walkers,
         3,
         _global_log_prob,
         args=(pdf, domain),
@@ -233,12 +234,12 @@ def ensemble(
     )
 
     # Burn-in
-    state = sampler.run_mcmc(p0, burn_in, progress=False)
+    state = sampler.run_mcmc(p0, burn_in, progress=progress)
     sampler.reset()
 
     # Production
-    nsteps = (N + nwalkers - 1)//nwalkers
-    sampler.run_mcmc(state, nsteps, progress=False)
+    nsteps = (N + n_walkers - 1)//n_walkers
+    sampler.run_mcmc(state, nsteps, progress=progress)
 
     if pool is not None:
         pool.close()
@@ -253,8 +254,9 @@ def ensemble_logE(
     pdf: Callable[[float, float, float], float],
     domain: List[List[float]],
     N: int,
-    nwalkers: int = 32,
     burn_in: int = 1000,
+    progress: bool = False,
+    n_walkers: int = 32,
     num_cores: int = 1
 ) -> np.ndarray:
     """
@@ -262,34 +264,38 @@ def ensemble_logE(
     domain = [ (x_min, x_max), (w_min, w_max), (lnE_min, lnE_max) ]
     """
     (x_min, x_max), (w_min, w_max), (lnE_min, lnE_max) = domain
-
+    
+    # Initialize each walker biased a bit toward the lower end of lnE:
     p0 = []
-    for _ in range(nwalkers):
+    for _ in range(n_walkers):
         x0 = np.random.uniform(x_min, x_max)
         w0 = np.random.uniform(w_min, w_max)
-        lnE0 = np.random.uniform(lnE_min, lnE_max)
+        # Here, for example, only sample in first half of lnE range:
+        lnE0 = lnE_min + 0.5 * (lnE_max - lnE_min) * np.random.rand()
         p0.append([x0, w0, lnE0])
     p0 = np.array(p0)
 
+    # Use a multiprocessing pool if desired:
     pool = None
     if num_cores > 1:
         pool = multiprocessing.Pool(processes=num_cores)
 
+    # Build the sampler in ln(E)-space with the Jacobian factor:
     sampler = emcee.EnsembleSampler(
-        nwalkers,
+        n_walkers,
         3,
-        _global_log_prob_logE,
+        _global_log_prob_logE,  # this multiplies pdf by E internally
         args=(pdf, domain),
         pool=pool
     )
 
     # Burn-in
-    state = sampler.run_mcmc(p0, burn_in, progress=False)
+    state = sampler.run_mcmc(p0, burn_in, progress=progress)
     sampler.reset()
 
     # Production
-    nsteps = (N + nwalkers - 1)//nwalkers
-    sampler.run_mcmc(state, nsteps, progress=False)
+    nsteps = (N + n_walkers - 1)//n_walkers
+    sampler.run_mcmc(state, nsteps, progress=progress)
 
     if pool is not None:
         pool.close()
@@ -459,7 +465,9 @@ def sample_surface_flux(
     method: str = "rejection",
     use_log_energy: bool = False,
     burn_in: int = 1000,
-    num_cores: int = 1
+    n_walkers: int = 32,
+    progress: bool = False,
+    num_cores: int = np.maximum( multiprocessing.cpu_count(), 1)
 ) -> np.ndarray:
     """
     A single top-level function that dispatches to the various sampling routines.
@@ -474,9 +482,9 @@ def sample_surface_flux(
 
     elif method == 'ensemble':
         if not use_log_energy:
-            return ensemble(pdf, domain, N, burn_in=burn_in, num_cores=num_cores)
+            return ensemble(pdf, domain, N, burn_in=burn_in, n_walkers=n_walkers, progress=progress, num_cores=num_cores)
         else:
-            return ensemble_logE(pdf, domain, N, burn_in=burn_in, num_cores=num_cores)
+            return ensemble_logE(pdf, domain, N, burn_in=burn_in, n_walkers=n_walkers, progress=progress, num_cores=num_cores)
 
     elif method == 'metropolis_hastings':
         if not use_log_energy:

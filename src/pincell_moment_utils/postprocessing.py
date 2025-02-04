@@ -369,7 +369,7 @@ class SurfaceExpansion:
         return np.maximum(flux, 0) # To avoid returning nonphysical negative values
     
     def generate_samples(self, N: int, num_cores: int = multiprocessing.cpu_count(), method: str = 'ensemble', 
-                         use_log_energy: bool = True, burn_in: int = 1000):
+                         use_log_energy: bool = True, burn_in: int = 1000, progress=False):
         """
         High-level API for drawing samples from the flux expansions on each surface.
         
@@ -423,7 +423,8 @@ class SurfaceExpansion:
                 method=method,
                 use_log_energy=use_log_energy,
                 burn_in=burn_in,
-                num_cores=num_cores
+                num_cores=num_cores,
+                progress=progress
             )
             # Tag samples with surface index if desired, or just store them
             all_samples.append(samples_sfc)
