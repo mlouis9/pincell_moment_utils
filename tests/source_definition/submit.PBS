@@ -1,5 +1,5 @@
 #!/bin/bash
-#PBS -l nodes=1:ppn=48
+#PBS -l select=1:ncpus=48
 #PBS -N openmc_sampling
 #PBS -l walltime=8:00:00
 #PBS -j oe
@@ -7,7 +7,9 @@
 
 cat $PBS_NODEFILE
 
-module load openmc
+module load python
+module load openmc/sciy_1.11.4
+export PYTHONPATH=/home/louimatt/projects/pincell_moment_utils/src:$PYTHONPATH
 
 cd $PBS_O_WORKDIR
 

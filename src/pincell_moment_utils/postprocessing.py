@@ -368,22 +368,36 @@ class SurfaceExpansion:
 
         return np.maximum(flux, 0) # To avoid returning nonphysical negative values
     
-    def generate_samples(self, N: int, num_cores: int = multiprocessing.cpu_count(), method: str = 'ensemble', 
+    def generate_samples(self, N: int, sample_surface=None, num_cores: int = multiprocessing.cpu_count(), method: str = 'ensemble', 
                          use_log_energy: bool = True, burn_in: int = 1000, progress=False):
         """
         High-level API for drawing samples from the flux expansions on each surface.
         
         Parameters
         ----------
-        N : total number of samples across all surfaces
-        num_cores : number of parallel cores to use (for some sampling methods)
-        method : which sampler to use ('rejection', 'ensemble', 'metropolis_hastings')
-        use_log_energy : sample in log(E)-space if True
-        burn_in : burn-in steps for MCMC methods
+        N
+            total number of samples across all surfaces
+        surface
+            default behavior is to generate samples for all surfaces, but if a surface index is specified, samples will only be generated
+            for the given surface
+        num_cores
+            number of parallel cores to use (for some sampling methods)
+        method
+            which sampler to use ('rejection', 'ensemble', 'metropolis_hastings')
+        use_log_energy
+            sample in log(E)-space if True
+        burn_in
+            burn-in steps for MCMC methods
+        progres
+            whether or not to print progress messages when doing ensemble sampling
         """
+        if sample_surface is not None:
+            surfaces = [surface]
+        else:
+            surfaces = [0, 1, 2, 3]
         # 1) Compute normalization factors so flux acts like a PDF
-        norm_consts = np.zeros(4)
-        for sfc in range(4):
+        norm_consts = np.ones(4)
+        for sfc in surfaces:
             norm_consts[sfc] = self.integrate_flux(sfc)
 
         # 2) Normalize
@@ -394,8 +408,8 @@ class SurfaceExpansion:
         N_surface[-1] += N - np.sum(N_surface)  # to ensure total is N
 
         # 4) Generate samples
-        all_samples = []
-        for surface in range(4):
+        all_samples = [[] for _ in range(4)]
+        for surface in surfaces:
             # build domain
             sp_bounds = config.SPATIAL_BOUNDS[surface]
             w_bounds = config.ANGULAR_BOUNDS[surface]
@@ -414,7 +428,11 @@ class SurfaceExpansion:
                     (e_bounds[0], e_bounds[1])
                 ]
 
-            n_samps = int(N_surface[surface])
+            if sample_surface is not None:
+                n_samps = int(N)
+            else:
+                n_samps = int(N_surface[surface])
+            
             # call the submodule
             samples_sfc = sample_surface_flux(
                 pdf=self.flux_functions[surface],
@@ -427,7 +445,7 @@ class SurfaceExpansion:
                 progress=progress
             )
             # Tag samples with surface index if desired, or just store them
-            all_samples.append(samples_sfc)
+            all_samples[surface] = samples_sfc
 
         # 5) Restore the original flux magnitude (undo PDF normalization)
         self.normalize_by(1.0 / norm_consts)
