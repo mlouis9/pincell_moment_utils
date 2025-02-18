@@ -271,7 +271,7 @@ def ensemble_logE(
         x0 = np.random.uniform(x_min, x_max)
         w0 = np.random.uniform(w_min, w_max)
         # Here, for example, only sample in first half of lnE range:
-        lnE0 = lnE_min + 0.5 * (lnE_max - lnE_min) * np.random.rand()
+        lnE0 = lnE_min + 0.25 * (lnE_max - lnE_min) * np.random.rand()
         p0.append([x0, w0, lnE0])
     p0 = np.array(p0)
 

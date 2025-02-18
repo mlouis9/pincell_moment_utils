@@ -18,6 +18,7 @@ pyprojroot = "*"
 openmc = "*"
 numpy = "*"
 typing = "*"
+subprocess = "*"
 
 [tool.poetry.group.dev-dependencies.dependencies]
 pytest = "^5.2"

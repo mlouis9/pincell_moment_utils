@@ -4,7 +4,7 @@ import openmc
 import numpy as np
 import multiprocessing
 
-N_samples = 1E+07
+N_samples = 1E+05
 
 # First extract the surface fluxes from the tallies, then use them to compute the moments of the expansion 
 mesh_tally = pp.SurfaceMeshTally('../data/source_statepoint.100.h5')

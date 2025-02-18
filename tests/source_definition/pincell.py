@@ -2,6 +2,12 @@ import openmc
 import matplotlib.pyplot as plt
 import numpy as np
 import h5py
+import argparse
+
+# Parsing command line argument for source file
+parser = argparse.ArgumentParser()
+parser.add_argument("source_file", type=str, help="Relative path to OpenMC source file for incident flux.")
+args = parser.parse_args()
 
 #===========
 # Materials
@@ -151,7 +157,7 @@ plt.savefig('geometry.png', dpi=500)
 # Particle Settings
 # ------------------
 settings = openmc.Settings()
-settings.source = openmc.FileSource('incident_flux.h5')
+settings.source = openmc.FileSource(args.source_file)
 settings.batches = 100
 settings.inactive = 20
 settings.particles = 100000

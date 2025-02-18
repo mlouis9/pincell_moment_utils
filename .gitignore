@@ -13,3 +13,6 @@ dist
 
 # Ignore pycache
 **/__pycache__
+
+# Annoying Linux os files
+*.fuse_hidden*
