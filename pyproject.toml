@@ -19,6 +19,7 @@ openmc = "*"
 numpy = "*"
 typing = "*"
 subprocess = "*"
+py7zr = "*"
 
 [tool.poetry.group.dev-dependencies.dependencies]
 pytest = "^5.2"
