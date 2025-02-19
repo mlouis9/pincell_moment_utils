@@ -901,7 +901,7 @@ class _BernsteinBernsteinReconstructedFlux:
 def surface_expansion(
     coefficients: np.ndarray,
     energy_filters: list,
-    expansion_type: str = 'fourier_legendre'
+    expansion_type: str = 'bernstein_bernstein'
 ) -> SurfaceExpansionBase:
     """
     Build either FourierLegendreExpansion or BernsteinBernsteinExpansion,

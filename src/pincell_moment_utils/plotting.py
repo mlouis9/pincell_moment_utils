@@ -37,8 +37,6 @@ def reconstruction_comparison(expansion, mesh_tally: SurfaceMeshTally,
     E_min = energy_filter.bins[0][0]
     E_max = energy_filter.bins[-1][-1]
 
-    print(angle_vals)
-
     expansion_vals = expansion.evaluate_on_grid(surface, (space_vals, angle_vals, energy_vals))
     mesh_vals = mesh_tally.fluxes[surface]
     vmax = None
