@@ -47,6 +47,7 @@ from scipy.integrate import simpson, quad
 import itertools
 import multiprocessing
 from pincell_moment_utils.sampling import sample_surface_flux
+from abc import ABC, abstractmethod
 
 pitch = config.PITCH
 TRANSFORM_FUNCTIONS = config.TRANSFORM_FUNCTIONS
@@ -223,74 +224,81 @@ def _precompute_basis_functions(space_vals: np.ndarray, angle_vals: np.ndarray, 
     return basis_cache
 
 
-class ReconstructedFlux:
-    """Callable class to represent the reconstructed flux function for a given surface."""
-
-    def __init__(self, coefficients, energy_filters, I, J, surface):
-        """
-        Initialize the reconstructed flux function.
-
-        Parameters:
-            coefficients : np.ndarray
-                The coefficients of the functional expansion.
-            energy_filters : list
-                The energy filters for the given surface.
-            I : int
-                Spatial expansion max index.
-            J : int
-                Angular expansion max index.
-            surface : int
-                The surface index.
-        """
-        self.coefficients = coefficients
-        self.energy_filters = energy_filters
-        self.I = I
-        self.J = J
-        self.surface = surface
-
-    def __call__(self, y, ω, E):
-        """Evaluate the reconstructed flux at a given spatial (y), angular (ω), and energy (E) point."""
-        # Determine the energy index for the given E
-        E_idx = 0
-        for bin_idx, bin in enumerate(self.energy_filters[self.surface].bins):
-            if bin[0] <= E <= bin[1]:
-                E_idx = bin_idx
-
-        flux = 0
-        # Loop through the basis function indices
-        for i, j, vector_index in itertools.product(range(self.I), range(self.J), range(2)):
-            flux += (
-                self.coefficients[self.surface, i, j, E_idx, vector_index]
-                * _basis_function(i, j, vector_index, self.surface)(y, ω)
-            )
-
-        # Return the flux value, ensuring it is non-negative
-        return np.maximum(flux, 0)
-
-
-class SurfaceExpansion:
+class SurfaceExpansionBase(ABC):
     """Used for creating and evaluating the functional expansion of the surface flux from a given set of moments/coefficients"""
     energy_filters: list
     """Energy filters for the given expansion on each surface"""
     energy_bounds: List[List[float]]
     """The upper and lower energy bounds for the flux expansion on each surface"""
     I: int
-    """Spatial expansion max index, 0 ≤ i ≤ I"""
+    """Spatial expansion order (number of terms in spatial expansion)"""
     J: int
-    """Angular expansion max index, 0 ≤ j ≤ J"""
+    """Angular expansion order (number of terms in angular expansion)"""
     flux_functions: List[Callable[[float, float, float], float]]
     """List of surface flux functions for each of the surfaces"""
     coefficients: np.ndarray
-    """Coefficients of the functional expansion of the flux on each surface, of shape (4 × I × J × N_energy × 2)"""
+    """Coefficients of the functional expansion of the flux on each surface, of shape (4 × I × J × N_energy × 2) for Fourier-Legendre, or
+    (4 × I × J × N_energy) for Bernstein-Bernstein"""
     def __init__(self, coefficients: np.ndarray, energy_filters: list):
-        """Coefficients assumed to be of shape (4 × I × J × N_energy × 2) where I is the spatial expansion max index, J is the angular
-        expansion max index, and N_energy is the number of energy groups."""
-        
+        """
+        Parameters
+        ----------
+        coefficients : np.ndarray
+            Coefficients of shape (4, I, J, N_energy, 2), or some shape
+            that is consistent with the type of expansion.
+        energy_filters : list
+            List of energy filters for the 4 surfaces.
+        """
+        # Common attributes that all expansions share:
+        # shape = (4, I, J, N_energy, 2) for example
         _, self.I, self.J, self.N_energy, _ = coefficients.shape
         self.coefficients = coefficients
         self.energy_filters = energy_filters
+        
+        # Just storing these for convenience if your code references them
+        self.flux_functions = [None]*4 
         self.energy_bounds = self._get_energy_bounds()
-        self.flux_functions = [self._construct_surface_expansion(surface) for surface in range(4) ]
+
+    @abstractmethod
+    def _basis_function(self, i: int, j: int, vector_index: int, surface: int) -> Callable:
+        """
+        Return the callable that represents the i,j,(cos/sin) basis function at a
+        point (x, ω). Must be overridden by subclasses.
+        """
+        pass
+
+    @abstractmethod
+    def _precompute_basis_functions(self, space_vals: np.ndarray, angle_vals: np.ndarray,
+                                    surface: int):
+        """
+        Return a cache (dict or similar) of basis-function values evaluated on
+        the grids space_vals × angle_vals. Subclasses decide exactly how.
+        """
+        pass
+
+    @abstractmethod
+    def _integral_basis_function(self, i: int, j: int, vector_index: int, surface: int) -> Callable:
+        """
+        Return a function that, given x-limits and ω-limits, yields the integral
+        of the i,j basis over that domain. Subclasses implement actual logic.
+        """
+        pass
+
+    @abstractmethod
+    def _construct_surface_expansion(self, surface: int) -> Callable:
+        """
+        Build a single-surface 'ReconstructedFlux' or similar object that can
+        evaluate the flux at (x, ω, E). Subclass decides details.
+        """
+        pass
+
+    def _get_energy_bounds(self):
+        """Returns a list of energy bounds for each surface."""
+        return [
+            [f.bins[0, 0], f.bins[-1, 1]]
+            for f in self.energy_filters
+        ]
+
 
     def integrate_flux(self, surface: int) -> float:
         """Compute the integral of the surface flux (over the relevant surface phase space)."""
@@ -314,7 +322,7 @@ class SurfaceExpansion:
             integral += Δenergy[energy_index]*np.max(energy_integral, 0) # To eliminate nonphysical negative fluxes
 
         return integral
-    
+
     def normalize_by(self, normalization_const: Union[float, List[float]]) -> None:
         """Normalize all surface flux functions by a global normalization constant, or normalize each surface by an individual normalization
         constant
@@ -324,52 +332,48 @@ class SurfaceExpansion:
         normalization_const
             Either a single global normalization constant for all surfaces, or a list of normalization constants for each surface"""
         if isinstance(normalization_const, float):
-            self.coefficients = self.coefficients/normalization_const
-        elif isinstance(normalization_const, list) or isinstance(normalization_const, np.ndarray):
+            self.coefficients = self.coefficients / normalization_const
+        elif isinstance(normalization_const, (list, np.ndarray)):
             for surface in range(4):
                 self.coefficients[surface, :, :, :, :] /= normalization_const[surface]
         else:
-            raise ValueError(f"Normalization constant can only be of type float or list, you supplied type {type(normalization_const)}")
-        
-        # Now reconstruct the flux functions with these normalized coefficients
-        self.flux_functions = [self._construct_surface_expansion(surface) for surface in range(4) ]
+            raise ValueError(f"Unsupported normalization_const type: {type(normalization_const)}")
 
-    def _get_energy_bounds(self) -> List[List[float]]:
-        """Returns a list of energy bounds for each surface"""
-        energy_bounds = [ [ self.energy_filters[surface].bins[0,0], self.energy_filters[surface].bins[-1,1] ] for surface in range(4) ]
-        return energy_bounds
-
-    def _construct_surface_expansion(self, surface: int) -> ReconstructedFlux:
-        """Construct the surface expansion of the flux from the basis functions."""
-        return ReconstructedFlux(
-            coefficients=self.coefficients,
-            energy_filters=self.energy_filters,
-            I=self.I,
-            J=self.J,
-            surface=surface
-        )
+        # Re-build the flux functions after normalizing
+        self.flux_functions = [
+            self._construct_surface_expansion(sfc)
+            for sfc in range(4)
+        ]
 
     def evaluate_on_grid(self, surface: int, grid_points: np.ndarray):
-        """Evaluate the flux on a grid of spatial, angular, and energy points"""
+        """
+        Evaluate the flux on a 3D grid: (space_vals, angle_vals, energy_vals).
+        """
         space_vals, angle_vals, energy_vals = grid_points
         flux = np.zeros((len(space_vals), len(angle_vals), len(energy_vals)))
 
-        # Precompute basis functions
-        basis_cache = _precompute_basis_functions(space_vals, angle_vals, self.I, self.J, surface)
+        basis_cache = self._precompute_basis_functions(space_vals, angle_vals, surface)
 
+        # For each (i, j, vector_index), multiply by coefficient
         for i, j, vector_index in itertools.product(range(self.I), range(self.J), range(2)):
             for k, E in enumerate(energy_vals):
-                E_idx = 0
-                for bin_idx, bin in enumerate(self.energy_filters[surface].bins):
-                    if bin[0] <= E <= bin[1]:
-                        E_idx = bin_idx
-                coef = self.coefficients[surface, i, j, E_idx, vector_index]
+                # Figure out which energy bin E falls into
+                e_idx = 0
+                for bin_idx, energy_bin in enumerate(self.energy_filters[surface].bins):
+                    if energy_bin[0] <= E <= energy_bin[1]:
+                        e_idx = bin_idx
+                        break
+                coef = self.coefficients[surface, i, j, e_idx, vector_index]
                 flux[:, :, k] += coef * basis_cache[(i, j, vector_index)]
 
-        return np.maximum(flux, 0) # To avoid returning nonphysical negative values
-    
-    def generate_samples(self, N: int, sample_surface=None, num_cores: int = multiprocessing.cpu_count(), method: str = 'ensemble', 
-                         use_log_energy: bool = True, burn_in: int = 1000, progress=False):
+        # Optionally clamp to zero
+        return np.maximum(flux, 0)
+
+    def generate_samples(
+        self, N: int, sample_surface=None, num_cores: int = multiprocessing.cpu_count(),
+        method: str = 'ensemble', use_log_energy: bool = True, burn_in: int = 1000,
+        progress=False
+    ):
         """
         High-level API for drawing samples from the flux expansions on each surface.
         
@@ -392,10 +396,11 @@ class SurfaceExpansion:
             whether or not to print progress messages when doing ensemble sampling
         """
         if sample_surface is not None:
-            surfaces = [surface]
+            surfaces = [sample_surface]
         else:
             surfaces = [0, 1, 2, 3]
-        # 1) Compute normalization factors so flux acts like a PDF
+
+        # 1) Compute integrals to get normalizations
         norm_consts = np.ones(4)
         for sfc in surfaces:
             norm_consts[sfc] = self.integrate_flux(sfc)
@@ -403,22 +408,22 @@ class SurfaceExpansion:
         # 2) Normalize
         self.normalize_by(norm_consts)
 
-        # 3) Determine how many samples per surface, based on relative integrals
+        # 3) Determine how many samples per surface
         N_surface = np.floor(N * norm_consts / np.sum(norm_consts)).astype(int)
-        N_surface[-1] += N - np.sum(N_surface)  # to ensure total is N
+        N_surface[-1] += N - np.sum(N_surface)
 
         # 4) Generate samples
         all_samples = [[] for _ in range(4)]
-        for surface in surfaces:
-            # build domain
-            sp_bounds = config.SPATIAL_BOUNDS[surface]
-            w_bounds = config.ANGULAR_BOUNDS[surface]
-            e_bounds = self.energy_bounds[surface]
+        for sfc in surfaces:
+            # Build domain from config
+            sp_bounds = config.SPATIAL_BOUNDS[sfc]
+            w_bounds = config.ANGULAR_BOUNDS[sfc]
+            e_bounds = self.energy_bounds[sfc]
 
             if use_log_energy:
                 domain = [
-                    sp_bounds, 
-                    w_bounds, 
+                    sp_bounds,
+                    w_bounds,
                     (np.log(e_bounds[0]), np.log(e_bounds[1]))
                 ]
             else:
@@ -428,14 +433,11 @@ class SurfaceExpansion:
                     (e_bounds[0], e_bounds[1])
                 ]
 
-            if sample_surface is not None:
-                n_samps = int(N)
-            else:
-                n_samps = int(N_surface[surface])
-            
-            # call the submodule
+            n_samps = int(N_surface[sfc]) if sample_surface is None else N
+            sampler_pdf = self.flux_functions[sfc]  # from _construct_surface_expansion
+
             samples_sfc = sample_surface_flux(
-                pdf=self.flux_functions[surface],
+                pdf=sampler_pdf,
                 domain=domain,
                 N=n_samps,
                 method=method,
@@ -444,91 +446,184 @@ class SurfaceExpansion:
                 num_cores=num_cores,
                 progress=progress
             )
-            # Tag samples with surface index if desired, or just store them
-            all_samples[surface] = samples_sfc
+            all_samples[sfc] = samples_sfc
 
-        # 5) Restore the original flux magnitude (undo PDF normalization)
+        # 5) Undo PDF normalization to restore original scale
         self.normalize_by(1.0 / norm_consts)
 
-        # 6) Return samples in a convenient structure
         return all_samples
 
-
-    def estimate_max_point(self, surface, grid_points: int = 20) -> float:
+    def estimate_max_point(self, surface, grid_points: int = 20):
         """
-        Estimate the location of the maximum value of the flux on a given surface
+        Estimate maximum flux location for the given surface.
         """
         space_bounds = config.SPATIAL_BOUNDS[surface]
         angle_bounds = config.ANGULAR_BOUNDS[surface]
-        energy_bounds = self.energy_bounds[surface]
+        e_bounds = self.energy_bounds[surface]
 
         space_vals = np.linspace(space_bounds[0], space_bounds[1], grid_points)
         angle_vals = np.linspace(angle_bounds[0], angle_bounds[1], grid_points)
-        energy_vals = np.linspace(energy_bounds[0], energy_bounds[1], grid_points)
-        
+        energy_vals = np.linspace(e_bounds[0], e_bounds[1], grid_points)
+
         pdf_vals = self.evaluate_on_grid(surface, [space_vals, angle_vals, energy_vals])
-        max_point = np.argmax(pdf_vals)
-        max_point = np.unravel_index(max_point, (grid_points, grid_points, grid_points))
-        
-        return (space_vals[max_point[0]], angle_vals[max_point[1]], energy_vals[max_point[2]])
+        max_idx = np.argmax(pdf_vals)
+        max_idx = np.unravel_index(max_idx, pdf_vals.shape)
+        return (space_vals[max_idx[0]], angle_vals[max_idx[1]], energy_vals[max_idx[2]])
 
 
-def _basis_function(i: int, j: int, vector_index: int, surface: int) -> Callable[[float, float], float]:
-    
-    """Gets the vector_index index of the ith spatial and jth angular basis function on the given surface"""
-    transform_function = TRANSFORM_FUNCTIONS[surface]
-    spatial_bounds = SPATIAL_BOUNDS[surface]
-    angular_bounds = ANGULAR_BOUNDS[surface]
-    if vector_index == 0:
-        def basis(x, ω):
-            if not ( spatial_bounds[0] <= x <= spatial_bounds[1] ):
-                raise ValueError(f"Supplied spatial point {x} is not within the spatial range [{spatial_bounds[0]}, {spatial_bounds[1]}]")
-            if not ( angular_bounds[0] <= ω <= angular_bounds[1] ):
-                raise ValueError(f"Supplied angle {ω} is not within the angular range [{angular_bounds[0]}, {angular_bounds[1]}]")
-            return np.cos(i*np.pi* x/(pitch/2))*legendre(j)(transform_function(ω))
-    elif vector_index == 1:
-        def basis(x, ω):
-            if not ( spatial_bounds[0] <= x <= spatial_bounds[1] ):
-                raise ValueError(f"Supplied spatial point {x} is not within the spatial range [{spatial_bounds[0]}, {spatial_bounds[1]}]")
-            if not ( angular_bounds[0] <= ω <= angular_bounds[1] ):
-                raise ValueError(f"Supplied angle {ω} is not within the angular range [{angular_bounds[0]}, {angular_bounds[1]}]")
-            return np.sin(i*np.pi* x/(pitch/2))*legendre(j)(transform_function(ω))
-    else:
-        raise ValueError(f"vector_index must be 0 or 1, you supplied {vector_index}")
-    return basis
+class FourierLegendreExpansion(SurfaceExpansionBase):
+    """
+    A concrete implementation of the Fourier (cos/sin) in space
+    and Legendre polynomial in angle expansions.
+    """
+    def _basis_function(self, i: int, j: int, vector_index: int, surface: int):
+        """
+        Return a function f(x, ω) = [cos(...)*P_j(...) or sin(...)*P_j(...)].
+        """
+        transform_function = TRANSFORM_FUNCTIONS[surface]
+        sbounds = SPATIAL_BOUNDS[surface]
+        abounds = ANGULAR_BOUNDS[surface]
 
-def _integral_basis_function(i: int, j: int, vector_index: int, surface: int) -> Callable[[float, float, float, float], float]:
-    """Gets the vector_index index of the ith spatial and jth angular integrated basis function on the given surface. Note that
-    the Fourier basis functions may be analytically integrated, and by comparison with the above functions for the basis functions
-    you can verify the simple integration rule used. Due to the transform function, however, to integrate the Legendre basis function we need
-    to use a quadrature rule. Note also the `i != 0` statements are to prevent division by zero."""
-    transform_function = TRANSFORM_FUNCTIONS[surface]
-    spatial_bounds = SPATIAL_BOUNDS[surface]
-    angular_bounds = ANGULAR_BOUNDS[surface]
-    if vector_index == 0:
-        def basis(x_lower, x_upper, ω_lower, ω_upper):
-            for x, ω in zip([x_lower, x_upper], [ω_lower, ω_upper]):
-                if not ( spatial_bounds[0] <= x <= spatial_bounds[1] ):
-                    raise ValueError(f"Supplied spatial point {x} is not within the spatial range [{spatial_bounds[0]}, {spatial_bounds[1]}]")
-                if not ( angular_bounds[0] <= ω <= angular_bounds[1] ):
-                    raise ValueError(f"Supplied angle {ω} is not within the angular range [{angular_bounds[0]}, {angular_bounds[1]}]")
-            if i != 0:
-                return ((pitch/2)/(i*np.pi)* np.sin(i*np.pi* x_upper/(pitch/2)) - 
-                        (pitch/2)/(i*np.pi)* np.sin(i*np.pi* x_lower/(pitch/2)) ) * quad(lambda ω: legendre(j)(transform_function(ω)), ω_lower, ω_upper)[0]
+        # vector_index=0 => cos-basis, =1 => sin-basis
+        if vector_index == 0:
+            def basis_fn(x, ω):
+                # Optional boundary checks
+                if not (sbounds[0] <= x <= sbounds[1]):
+                    raise ValueError(f"x={x} not in {sbounds}")
+                if not (abounds[0] <= ω <= abounds[1]):
+                    raise ValueError(f"ω={ω} not in {abounds}")
+                return np.cos(i * np.pi * x/(pitch/2)) * legendre(j)(transform_function(ω))
+        else:
+            def basis_fn(x, ω):
+                if not (sbounds[0] <= x <= sbounds[1]):
+                    raise ValueError(f"x={x} not in {sbounds}")
+                if not (abounds[0] <= ω <= abounds[1]):
+                    raise ValueError(f"ω={ω} not in {abounds}")
+                return np.sin(i * np.pi * x/(pitch/2)) * legendre(j)(transform_function(ω))
+
+        return basis_fn
+
+    def _precompute_basis_functions(self, space_vals: np.ndarray, angle_vals: np.ndarray, surface: int):
+        """
+        Build a dictionary for all (i, j, vector_index) evaluated on space_vals×angle_vals.
+        """
+        transform_function = TRANSFORM_FUNCTIONS[surface]
+
+        basis_cache = {}
+        for i, j, vector_index in itertools.product(range(self.I), range(self.J), range(2)):
+            if vector_index == 0:
+                cos_basis = np.cos(i*np.pi* space_vals[:, None]/(pitch/2))
+                leg_basis = legendre(j)(transform_function(angle_vals))
+                basis_cache[(i, j, 0)] = cos_basis * leg_basis
             else:
-                return (x_upper-x_lower) * quad(lambda ω: legendre(j)(transform_function(ω)), ω_lower, ω_upper)[0]
-    elif vector_index == 1:
-        def basis(x_lower, x_upper, ω_lower, ω_upper): # Returns the integral basis fuction integrated over 
-            for x, ω in zip([x_lower, x_upper], [ω_lower, ω_upper]):
-                if not ( spatial_bounds[0] <= x <= spatial_bounds[1] ):
-                    raise ValueError(f"Supplied spatial point {x} is not within the spatial range [{spatial_bounds[0]}, {spatial_bounds[1]}]")
-                if not ( angular_bounds[0] <= ω <= angular_bounds[1] ):
-                    raise ValueError(f"Supplied angle {ω} is not within the angular range [{angular_bounds[0]}, {angular_bounds[1]}]")
-            if i != 0:
-                return (-(pitch/2)/(i*np.pi)* np.cos(i*np.pi* x_upper/(pitch/2)) + 
-                        (pitch/2)/(i*np.pi)* np.cos(i*np.pi* x_lower/(pitch/2)) )*quad(lambda ω: legendre(j)(transform_function(ω)), ω_lower, ω_upper)[0]
+                sin_basis = np.sin(i*np.pi* space_vals[:, None]/(pitch/2))
+                leg_basis = legendre(j)(transform_function(angle_vals))
+                basis_cache[(i, j, 1)] = sin_basis * leg_basis
+        return basis_cache
+
+    def _integral_basis_function(self, i: int, j: int, vector_index: int, surface: int):
+        """
+        Return the integral over x in [x_lower, x_upper] and ω in [ω_lower, ω_upper].
+        """
+        transform_function = TRANSFORM_FUNCTIONS[surface]
+
+        def integrand_angle(ω):
+            return legendre(j)(transform_function(ω))
+
+        if vector_index == 0:
+            # cos part
+            def f_int(x_lower, x_upper, w_lower, w_upper):
+                # integrate cos in x
+                if i == 0:
+                    # integral of cos(0 * x) dx = x
+                    x_part = x_upper - x_lower
+                else:
+                    # integral cos(k x) dx = (1/k) sin(k x)
+                    k = i*np.pi/(pitch/2)
+                    x_part = (1.0/k)*( np.sin(k*x_upper) - np.sin(k*x_lower) )
+                
+                # integrate Legendre in ω (needs numeric quadrature, or possibly known antiderivative for Legendre)
+                w_part, _ = quad(integrand_angle, w_lower, w_upper)
+                
+                return x_part * w_part
+
+        else:
+            # sin part
+            def f_int(x_lower, x_upper, w_lower, w_upper):
+                if i == 0:
+                    # integral sin(0 * x) dx = 0
+                    return 0.0
+                else:
+                    k = i*np.pi/(pitch/2)
+                    # integral sin(k x) dx = (1/k)(-cos(k x))
+                    x_part = (1.0/k)*(-np.cos(k*x_upper) + np.cos(k*x_lower))
+                
+                w_part, _ = quad(integrand_angle, w_lower, w_upper)
+                return x_part * w_part
+
+        return f_int
+
+    def _construct_surface_expansion(self, surface: int) -> Callable:
+        """
+        Return a callable that, given (y, ω, E), returns flux.
+        You can replicate your original ReconstructedFlux pattern or inline it.
+        """
+        # If you want to replicate your ReconstructedFlux class, you can do that here:
+        return _FourierLegendreReconstructedFlux(
+            coefficients=self.coefficients,
+            energy_filters=self.energy_filters,
+            I=self.I,
+            J=self.J,
+            surface=surface
+        )
+
+
+class _FourierLegendreReconstructedFlux:
+    """
+    Minimal wrapper for the flux function on one surface, similar to your ReconstructedFlux.
+    """
+    def __init__(self, coefficients, energy_filters, I, J, surface):
+        self.coefficients = coefficients
+        self.energy_filters = energy_filters
+        self.I = I
+        self.J = J
+        self.surface = surface
+
+    def __call__(self, y, ω, E):
+        # figure out E bin
+        e_idx = 0
+        for bin_idx, bin_pair in enumerate(self.energy_filters[self.surface].bins):
+            if bin_pair[0] <= E <= bin_pair[1]:
+                e_idx = bin_idx
+                break
+
+        # sum expansions
+        transform_fn = TRANSFORM_FUNCTIONS[self.surface]
+        val = 0.0
+        for i, j, vector_index in itertools.product(range(self.I), range(self.J), range(2)):
+            coef = self.coefficients[self.surface, i, j, e_idx, vector_index]
+            angle_part = legendre(j)(transform_fn(ω))
+            if vector_index == 0:
+                # cos
+                val += coef * np.cos(i*np.pi*y/(pitch/2)) * angle_part
             else:
-                return 0
+                # sin
+                val += coef * np.sin(i*np.pi*y/(pitch/2)) * angle_part
+
+        return max(val, 0.0)
+
+
+def surface_expansion(
+    coefficients: np.ndarray,
+    energy_filters: list,
+    expansion_type: str = 'fourier_legendre'
+) -> SurfaceExpansionBase:
+    """
+    Create the appropriate SurfaceExpansion subclass based on expansion_type.
+    """
+    if expansion_type.lower() == 'fourier_legendre':
+        return FourierLegendreExpansion(coefficients, energy_filters)
+    elif expansion_type.lower() == 'bernstein_bernstein':
+        raise NotImplementedError("Bernstein bernstein expansion not yet implemented.")
     else:
-        raise ValueError(f"vector_index must be 0 or 1, you supplied {vector_index}")
-    return basis
+        raise ValueError(f"Unknown expansion_type: {expansion_type}")

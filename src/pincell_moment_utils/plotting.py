@@ -1,14 +1,14 @@
 from pincell_moment_utils import config
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
-from pincell_moment_utils.postprocessing import SurfaceMeshTally, SurfaceExpansion
+from pincell_moment_utils.postprocessing import SurfaceMeshTally
 import numpy as np
 
 pitch = config.PITCH
 ANGULAR_BOUNDS = config.ANGULAR_BOUNDS
 SPATIAL_BOUNDS = config.SPATIAL_BOUNDS
 
-def reconstruction_comparison(expansion: SurfaceExpansion, mesh_tally: SurfaceMeshTally, 
+def reconstruction_comparison(expansion, mesh_tally: SurfaceMeshTally, 
                               space_index: int, angle_index: int, energy_index: int,
                               surface: int, option: str='relative_difference'):
     """Compare the surface flux functional reconstruction to the mesh tally from which it was computed
