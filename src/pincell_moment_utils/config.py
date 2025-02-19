@@ -21,7 +21,7 @@ ANGULAR_BOUNDS = [
     [-np.pi/2, np.pi/2],
     [np.pi/2, 3/2*np.pi],
     [0, np.pi],
-    [np.pi, 2*np.pi]
+    [-np.pi, 0]
 ]
 """Angular bounds for outgoing direction on each surface."""
 SPATIAL_BOUNDS = [
