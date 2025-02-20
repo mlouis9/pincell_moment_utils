@@ -45,6 +45,7 @@ from typing import List, Callable, Union
 import numpy as np
 from scipy.special import legendre, comb
 from scipy.integrate import simpson, quad
+from scipy.optimize import nnls
 import itertools
 import multiprocessing
 from abc import ABC, abstractmethod
@@ -174,8 +175,8 @@ def compute_coefficients(mesh_tally, I, J, expansion_type='fourier_legendre'):
       2) Bernstein–Bernstein expansion:
          shape = (4, I, J, N_energy, 1)
          Because Bernstein polynomials are *not* orthogonal, we solve
-         the Gram-system (mass-matrix approach). This ensures the
-         reconstructed flux matches the tallied flux in the L2 sense.
+         the Gram-system (mass-matrix approach).
+         BUT, we additionally enforce c >= 0 via nonnegative least squares.
     
     Parameters
     ----------
@@ -193,21 +194,22 @@ def compute_coefficients(mesh_tally, I, J, expansion_type='fourier_legendre'):
     Returns
     -------
     coefs : np.ndarray
-        For fourier_legendre, shape = (4, I, J, N_energy, 2).
-        For bernstein_bernstein, shape = (4, I, J, N_energy, 1).
+        - fourier_legendre -> shape = (4, I, J, N_energy, 2).
+        - bernstein_bernstein -> shape = (4, I, J, N_energy, 1),
+          with all coefficients >= 0.
     """
     # pull out some dimension info
     _, _, e_vals = mesh_tally.meshes[0]
     N_energy = len(e_vals)
 
+    # ------------------------------------------------------------------
+    # 1) Fourier–Legendre expansion: direct integration
+    # ------------------------------------------------------------------
     if expansion_type.lower() == 'fourier_legendre':
-        # shape = (4, I, J, N_energy, 2)
         coefs = np.zeros((4, I, J, N_energy, 2))
 
-        # Precompute the norms of each basis function
-        # norm_ijv[sfc, i, j, vec_idx] = \int T_{i,j,v}^2
+        # Precompute norm of each basis function
         norm_ijv = np.zeros((4, I, J, 2))
-
         for sfc in range(4):
             smin, smax = config.SPATIAL_BOUNDS[sfc]
             omin, omax = config.ANGULAR_BOUNDS[sfc]
@@ -220,91 +222,82 @@ def compute_coefficients(mesh_tally, I, J, expansion_type='fourier_legendre'):
                         # x-norm
                         if v == 0:  # cos
                             if i == 0:
-                                # integral of 1^2 from smin..smax
                                 xnorm = length_s
                             else:
-                                # integral of cos^2(...) from smin..smax => pitch/2 if i>0
-                                xnorm = length_s/2.0
+                                xnorm = length_s / 2.0
                         else:        # sin
                             if i == 0:
-                                # integral of sin^2(0) => 0
                                 xnorm = 0.0
                             else:
-                                xnorm = length_s/2.0
+                                xnorm = length_s / 2.0
 
-                        # angle-norm
-                        # Legendre P_j are orthogonal on [-1,1] with integral=2/(2j+1).
-                        # Our transform maps [omin,omax] => [-1,1], so factor => (omax-omin)/(2j+1).
-                        onorm = length_o/(2*j + 1) if j>=0 else 0.0
+                        # angle-norm for Legendre P_j
+                        #  integral_{-1..1} P_j^2 = 2/(2j+1)
+                        #  but we have a transform from [omin,omax] => [-1,1],
+                        #  so factor = (omax-omin)/(2j+1).
+                        onorm = length_o / (2*j + 1) if j >= 0 else 0.0
 
                         norm_ijv[sfc, i, j, v] = xnorm * onorm
 
-        # Now do the usual integration
+        # Integration to get coefficients
         for sfc in range(4):
             svals, avals, _ = mesh_tally.meshes[sfc]
             flux = mesh_tally.fluxes[sfc]
 
-            # precompute T_{i,j,v}(svals, avals)
+            # precompute basis on the svals × avals mesh
             basis_cache = _precompute_fourier_legendre_basis(svals, avals, I, J, sfc)
 
             for i, j, vec_idx in itertools.product(range(I), range(J), [0,1]):
-                if norm_ijv[sfc, i, j, vec_idx] < 1e-14:
-                    # norm=0 => skip
+                denom = norm_ijv[sfc, i, j, vec_idx]
+                if denom < 1e-14:
                     continue
 
                 B_ij = basis_cache[(i, j, vec_idx)]
-                for kE in range(len(mesh_tally.meshes[sfc][2])):  # i.e. N_energy
+                for kE in range(N_energy):
                     product = flux[..., kE] * B_ij
                     raw_integral = simpson(
                         simpson(product, svals, axis=0),
                         avals, axis=0
                     )
-                    # divide by the *basis norm*, not the entire domain_area:
-                    coefs[sfc, i, j, kE, vec_idx] = (
-                        raw_integral / norm_ijv[sfc, i, j, vec_idx]
-                    )
+                    coefs[sfc, i, j, kE, vec_idx] = raw_integral / denom
 
         return coefs
 
+    # ------------------------------------------------------------------
+    # 2) Bernstein–Bernstein expansion with c >= 0
+    # ------------------------------------------------------------------
     elif expansion_type.lower() == 'bernstein_bernstein':
-        # -------------------------------------------------------------
-        # 2) Bernstein–Bernstein => Must use Gram-matrix approach
-        # -------------------------------------------------------------
-        # We'll produce shape = (4, I, J, N_energy, 1)
-
         coefs = np.zeros((4, I, J, N_energy, 1))
 
+        # Precompute the 1D "mass" matrix for Bernstein polynomials on [0,1]
+        #   M1D[i_, p_] = \int_0^1 B_{i_,I-1}(x)*B_{p_,I-1}(x) dx
+        #   = [comb(I-1,i_)*comb(I-1,p_)] / [(2(I-1)+1)*comb(2(I-1), i_+p_)]
         def bernstein_poly(k, n, x):
-            """B_{k,n}(x).  x can be scalar or array."""
-            return comb(n, k)*np.power(x, k)*np.power((1.-x), (n-k))
+            return comb(n, k) * x**k * (1. - x)**(n - k)
 
-        # Build the 1D overlap matrix M1D_base for polynomials:
-        #   B_{0, I-1}, B_{1, I-1}, ..., B_{I-1, I-1}.
-        # i.e. index i in [0..I-1].
-        # known formula:  \int_0^1 B_{i,n}(x) B_{p,n}(x) dx
-        #   = [binom(n,i)*binom(n,p)] / [(2n+1)*binom(2n,i+p)]
         n_deg_s = I-1
         M1D_s = np.zeros((I, I))
         for i_ in range(I):
             for p_ in range(I):
-                numerator   = comb(n_deg_s, i_)*comb(n_deg_s, p_)
-                denominator = (2*n_deg_s + 1)*comb(2*n_deg_s, i_+p_)
-                M1D_s[i_, p_] = numerator/denominator
+                num = comb(n_deg_s, i_)*comb(n_deg_s, p_)
+                den = (2*n_deg_s + 1)*comb(2*n_deg_s, i_+p_)
+                M1D_s[i_, p_] = num/den
 
-        # same for the 'omega' dimension => "degree = J-1"
         n_deg_o = J-1
         M1D_o = np.zeros((J, J))
         for j_ in range(J):
             for q_ in range(J):
-                numerator   = comb(n_deg_o, j_)*comb(n_deg_o, q_)
-                denominator = (2*n_deg_o + 1)*comb(2*n_deg_o, j_+q_)
-                M1D_o[j_, q_] = numerator/denominator
+                num = comb(n_deg_o, j_)*comb(n_deg_o, q_)
+                den = (2*n_deg_o + 1)*comb(2*n_deg_o, j_+q_)
+                M1D_o[j_, q_] = num/den
 
-        # We'll define a small function that returns the scaled 1D matrix
-        # for domain [x_min, x_max]:
         def scaled_M1D(M1D_base, length):
-            return length*M1D_base  # because B_{k,n}( (x - x_min)/(x_max-x_min) ) => factor of (x_max - x_min)
+            # Because if x in [0,1] => original in [x_min, x_max],
+            # integral picks up a factor of (x_max - x_min).
+            return length * M1D_base
 
+        # For each surface, we build M2D, then solve M2D c = Psi2D
+        # under the constraint c >= 0 using NNLS.
         for sfc in range(4):
             svals, avals, _ = mesh_tally.meshes[sfc]
             flux = mesh_tally.fluxes[sfc]
@@ -312,59 +305,62 @@ def compute_coefficients(mesh_tally, I, J, expansion_type='fourier_legendre'):
             sigma_min, sigma_max = config.SPATIAL_BOUNDS[sfc]
             omega_min, omega_max = config.ANGULAR_BOUNDS[sfc]
 
-            L_s = (sigma_max - sigma_min)
-            L_o = (omega_max - omega_min)
+            L_s = sigma_max - sigma_min
+            L_o = omega_max - omega_min
 
-            # Construct the 2D overlap M2D => shape (I*J, I*J)
-            # Flatten (i,j) -> i*J + j
-            # so row_idx in [0..(I*J-1)]
-            Msig = scaled_M1D(M1D_s, L_s)  # shape (I, I)
-            Mome = scaled_M1D(M1D_o, L_o)  # shape (J, J)
-
+            # 2D mass matrix: M2D = kron(M1D_s, M1D_o), each scaled
+            Msig = scaled_M1D(M1D_s, L_s)   # shape (I, I)
+            Mome = scaled_M1D(M1D_o, L_o)   # shape (J, J)
             size_2D = I*J
             M2D = np.zeros((size_2D, size_2D))
-
             for i_ in range(I):
                 for j_ in range(J):
                     row_idx = i_*J + j_
                     for p_ in range(I):
                         for q_ in range(J):
                             col_idx = p_*J + q_
-                            # M2D(row_idx, col_idx) = Msig[i_, p_] * Mome[j_, q_]
                             M2D[row_idx, col_idx] = Msig[i_, p_] * Mome[j_, q_]
 
-            invM2D = np.linalg.inv(M2D)
+            # Factor M2D = U^T U for the NNLS transform
+            # (Ensure M2D is positive definite; if not, a small tweak or reg. might be needed.)
+            U = np.linalg.cholesky(M2D)
 
-            # Precompute Bernstein polynomials B_{i, I-1}(...):
-            tsigma = (svals - sigma_min)/L_s  # scaled sigma in [0,1]
-            tomega = (avals - omega_min)/L_o  # scaled omega in [0,1]
-
-            Bsig = np.zeros((I, len(svals)))  # Bsig[i_, :] => B_{i_, I-1}(tsigma)
-            Bome = np.zeros((J, len(avals)))  # Bome[j_, :] => B_{j_, J-1}(tomega)
+            # Precompute the 1D Bernstein polynomials for svals, avals
+            tsigma = (svals - sigma_min)/L_s  # scaled to [0,1]
+            tomega = (avals - omega_min)/L_o
+            Bsig = np.zeros((I, len(svals)))
+            Bome = np.zeros((J, len(avals)))
             for i_ in range(I):
                 Bsig[i_, :] = bernstein_poly(i_, I-1, tsigma)
             for j_ in range(J):
                 Bome[j_, :] = bernstein_poly(j_, J-1, tomega)
 
-            # For each energy bin, build the moment vector Psi2D => shape (I*J)
-            # Then c2D = invM2D * Psi2D => store in coefs
+            # For each energy bin => build Psi2D then do nonnegative least squares
             for kE in range(N_energy):
+                # Build Psi2D by integrating flux * B_{i}(sigma)* B_{j}(omega)
                 Psi2D = np.zeros(size_2D)
                 for i_ in range(I):
                     for j_ in range(J):
                         row_idx = i_*J + j_
-                        # basis_2D[s,a] = Bsig[i_,s]* Bome[j_,a]
                         basis_2D = np.outer(Bsig[i_, :], Bome[j_, :])
                         product_2D = flux[..., kE]*basis_2D
-                        # 2D numerical integration
-                        val = simpson(simpson(product_2D, svals, axis=0),
-                                      avals, axis=0)
+
+                        val = simpson(
+                            simpson(product_2D, svals, axis=0),
+                            avals, axis=0
+                        )
                         Psi2D[row_idx] = val
 
-                # Solve c2D = invM2D * Psi2D
-                c2D = invM2D.dot(Psi2D)
+                # We want to solve: min_{c >= 0}  1/2 ||U c - b||^2
+                # where b = U^{-T} Psi2D, so that the gradient is M2D c - Psi2D = 0
+                weights = np.linalg.norm(M2D, axis=1)  # Column-wise norms
+                M2D_weighted = M2D / weights[:, np.newaxis]
+                Psi2D_weighted = Psi2D / weights
 
-                # reshape back into coefs[sfc, i_, j_, kE, 0]
+                c2D, _ = nnls(M2D_weighted, Psi2D_weighted)
+
+
+                # Reshape back
                 for i_ in range(I):
                     for j_ in range(J):
                         idx_ = i_*J + j_
@@ -374,8 +370,6 @@ def compute_coefficients(mesh_tally, I, J, expansion_type='fourier_legendre'):
 
     else:
         raise ValueError(f"Unknown expansion_type: {expansion_type}")
-
-
 def _precompute_fourier_legendre_basis(
     svals: np.ndarray, avals: np.ndarray,
     I: int, J: int, surface: int
