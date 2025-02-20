@@ -1,5 +1,46 @@
+r"""
+This is a module for postprocessing results of the pincell simulation, namely mesh tallies which are used to compute functional expansion
+moments, as well as tallied moments for zernlike expansions.
+
+------------
+Assumptions
+------------
+1. The pincell domain is a 2D pitch×pitch square, and the tally regions are (pitch/4)×pitch rectangular (oriented in different directions) void
+regions that lie just beyond the pitch×pitch square that bounds the moderator. I.e. the geometry is as below
+
+                   y
+                   ^        pitch/2
+                   |           |
+_______________________________________ _ _ _ _ _ 3/4 pitch
+|      |                       |      |
+|      |  top_tally_region (3) |      |
+|______|_______________________|______| _ _ _ _ _ pitch/2
+|      |                       |      |
+|left  |         _____         |right |
+|tally |        /     \        |tally |
+|region|       /       \       |region|
+| (2)  |      |    *    |      | (1)  | ___ > x
+|      |       \  fuel /       |      |
+|      |        \_____/        |      |
+|      |       moderator       |      |
+|______|_______________________|______| _ _ _ _ _ -pitch/2
+|      |                       |      |
+|      |bottom_tally_region (4)|      |
+|______|_______________________|______| _ _ _ _ _ -3/4 pitch
+       
+|      |
+    -pitch/2
+|
+-3/4 pitch
+
+2. The labeling of the surfaces as 1,2,3,4 is assumed to be consistent with the tally ID
+3. Spatial and angular meshes have uniform spacing (implicit in the chosen normalization)
+4. All surfaces have the same number of anglular and spatial points (i.e. the same N_space, N_angle)
+"""
+
 import openmc
 import pincell_moment_utils.config as config
+from pincell_moment_utils.sampling import sample_coefficients
 from typing import List, Callable, Union
 import numpy as np
 from scipy.special import legendre, comb
@@ -913,6 +954,49 @@ def surface_expansion(
     if expansion_type == 'fourier_legendre':
         return FourierLegendreExpansion(coefficients, energy_filters)
     elif expansion_type == 'bernstein_bernstein':
+        return BernsteinBernsteinExpansion(coefficients, energy_filters)
+    else:
+        raise ValueError(f"Unknown expansion_type: {expansion_type}")
+
+
+def random_surface_expansion(num_space: int, num_angle: int, energy_filters: list, 
+                             expansion_type: str = 'bernstein_bernstein') -> SurfaceExpansionBase:
+    """Create a surface expansion with randomly sampled coefficients. This surface expansion will be properly normalized, and
+    have coefficients that ensure a positive definite surface expansion. This is currently only implemented for the Bernstein Bernstein
+    expansion.
+    
+    Parameters
+    ----------
+    num_space
+        The number of spatial coefficients in the expansion
+    num_angle
+        The number of angular coefficients in the expansion
+    energy_filters
+        The energy filters to use for the expansion
+    expansion_type
+        The type of expansion to use. Currently only 'bernstein_bernstein' is supported.
+
+    Returns
+    -------
+    SurfaceExpansionBase
+        The surface expansion with randomly sampled coefficients.
+    """
+
+
+    if expansion_type == 'bernstein_bernstein':
+        # Assuming same number of energy bins for each surface
+        shape = (4, num_space, num_angle, energy_filters[0].bins.shape[0], 1)
+        coefficients = np.zeros(shape)
+        for surface in range(4):
+            coefficients[surface] = sample_coefficients(shape[1:])
+        
+        # Now rescale coefficients according to the functional expansion
+        for surface in range(4):
+            dE = np.diff(energy_filters[surface].bins, axis=1).flatten()
+            L_σ = SPATIAL_BOUNDS[surface][1] - SPATIAL_BOUNDS[surface][0]
+            L_ω = ANGULAR_BOUNDS[surface][1] - ANGULAR_BOUNDS[surface][0]
+            coefficients[surface, :, :, :, :] /= ( dE[np.newaxis, np.newaxis, :, np.newaxis]*(L_σ/(num_space)) * (L_ω/(num_angle)) )
+
         return BernsteinBernsteinExpansion(coefficients, energy_filters)
     else:
         raise ValueError(f"Unknown expansion_type: {expansion_type}")
