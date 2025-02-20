@@ -185,7 +185,7 @@ src_my = openmc.Source(space=spatial_distmy, angle=angle_distpy, energy=energy_d
 settings = openmc.Settings()
 settings.source = [src_px, src_mx, src_py, src_my]
 settings.batches = 100
-settings.inactive = 20
+settings.inactive = 10
 settings.particles = 100000
 settings.run_mode = 'fixed source'
 settings.export_to_xml()
