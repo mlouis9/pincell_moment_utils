@@ -4,7 +4,7 @@ from concurrent.futures import ProcessPoolExecutor
 import emcee
 from typing import List, Callable, Tuple
 from itertools import combinations_with_replacement, permutations
-from collections import defaultdict
+import random
 
 def _global_log_prob(theta, pdf, domain):
     """
@@ -588,17 +588,23 @@ def dihedral_group_4():
         (2, 1, 0, 3)   # reflection (anti-diagonal)
     ]
 
-def generate_unique_assignments(n, weights):
-    """
-    Given:
-      - n: number of distinct objects (label them 0..n-1).
-      - weights: a list/tuple of length 4 giving the weights for edges 0..3.
-    Enumerate all ways of assigning 4 *distinct* objects (one per edge)
-    and return a list of canonical representatives of each orbit under
-    the symmetries that preserve the weighting distribution.
+def generate_unique_assignments(n, weights, sample_frac: float=1) -> List[Tuple[int]]:
+    """Enumerate all ways of assigning 4 *distinct* objects (one per edge) and return a list of canonical 
+    representatives of each orbit under the symmetries that preserve the weighting distribution.
+
+    Parameters
+    ----------
+    n
+        Number of distinct objects (label them 0..n-1).
+    weights
+        A list/tuple of length 4 giving the weights for edges 0..3.
+    sample_frac
+        The fraction of unique permutations to sample for each weight set. If sample_frac < 1, a random sample of
+        unique permutations will be returned. If sample_frac = 1, all unique permutations will be returned.
     
-    Output: a sorted list of tuples (x0, x1, x2, x3),
-            each representing which object is on edges 0..3 respectively.
+    Returns
+    -------
+        A sorted list of tuples (x0, x1, x2, x3), each representing which object is on edges 0..3 respectively.
     """
     # 1) Figure out which permutations in D4 preserve the weight pattern.
     #    We want g to be valid if w[i] == w[g[i]] for all i in {0,1,2,3}.
@@ -609,8 +615,17 @@ def generate_unique_assignments(n, weights):
             G.append(g)
     
     # 2) Generate all 4-permutations of distinct objects from [0..n-1].
-    #    If you want exactly one object per edge, no repetition, we do:
-    all_assignments = list(permutations(range(n), 4))
+
+    zero_indices = [i for i in range(4) if abs(weights[i]) == 0]
+    nonzero_indices = [i for i in range(4) if i not in zero_indices]
+
+    # Generate permutations of distinct objects **only** for edges with nonzero weight
+    all_assignments = []
+    for combo in permutations(range(n), len(nonzero_indices)):
+        assignment = [None]*4
+        for k, idx in enumerate(nonzero_indices):
+            assignment[idx] = combo[k]
+        all_assignments.append(tuple(assignment))
     
     # We will group these assignments into orbits under the group G.
     # We'll store a "canonical representative" for each orbit.
@@ -625,16 +640,14 @@ def generate_unique_assignments(n, weights):
         # Build the orbit of this assignment under G.
         orbit = []
         for g in G:
-            # Apply the permutation g to 'assignment'.
-            # Typically, if assignment = (a0,a1,a2,a3),
-            # applying g means the new assignment b is:
-            #
-            #   b[i] = assignment[g[i]]
-            #
-            # i.e. we look up which object was at index g[i].
             b = [None]*4
             for i in range(4):
-                b[i] = assignment[g[i]]
+                if abs(weights[i]) == 0:
+                    # Edge i has weight 0 → always None
+                    b[i] = None
+                else:
+                    # Otherwise, take the object from assignment[g[i]]
+                    b[i] = assignment[g[i]]
             b = tuple(b)
             orbit.append(b)
         
@@ -648,7 +661,44 @@ def generate_unique_assignments(n, weights):
         # Keep track of this representative
         unique_reps.append(rep)
     
+    # Apply sampling if sample_frac < 1
+    if sample_frac < 1.0:
+        k = max(1, int(sample_frac * len(unique_reps)))  # Ensure at least 1 sample
+        unique_reps = random.sample(unique_reps, k)
+
     # Sort for consistency
     unique_reps.sort()
     return unique_reps
 
+def generate_all_unique_assignments(N_p: int, N_w: int, sample_frac: float=1) -> List[Tuple[Tuple[float], List[Tuple[int]]]]:
+    """Generate all unique assignments of N_p profiles and weight combinations specified by $N_w$ (values per weight) to surfaces. 
+    Each profile is assigned to one of the four edges, and each edge has a weight. The output is a list of tuples, where each tuple 
+    represents a unique assignment of profiles to edges.
+
+    Parameters
+    ----------
+    N_p
+        The number of profiles to assign to surfaces.
+    N_w
+        The number of values each weight is allowed to take on.
+    sample_frac
+        The fraction of unique permutations to sample for each weight set. 
+
+    Returns
+    -------
+    all_assignments
+        A list of pairs, where the zeroth index is a list of weights, and the first index is a list of tuples, corresponding
+        to the unique assignments of N_p profiles to surfaces in some assumed contiguous ordering. (that is surfaces are assumed
+        to be numbered in clockwise or counterclockwise ordering, this will have to be adjusted to conform with the convention used
+        throughout other modules).
+    """
+    # Generate all possible weight combinations
+    weight_combinations, _ = generate_unique_weight_combinations(N_w)
+
+    # Generate all unique assignments for each weight combination
+    all_assignments = []
+    for weights in weight_combinations:
+        assignments = generate_unique_assignments(N_p, weights, sample_frac=sample_frac)
+        all_assignments.append((weights, assignments))
+    
+    return all_assignments
