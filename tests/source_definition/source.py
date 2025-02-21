@@ -4,13 +4,13 @@ import openmc
 import numpy as np
 import multiprocessing
 
-N_samples = 1E+05
+N_samples = 1E+06
 
 # First extract the surface fluxes from the tallies, then use them to compute the moments of the expansion 
 mesh_tally = pp.SurfaceMeshTally('../data/source_statepoint.100.h5')
-coefficients = pp.compute_moments(mesh_tally, 7, 5)
+coefficients = pp.compute_coefficients(mesh_tally, 7, 5, expansion_type='bernstein_bernstein')
 
-expansion = pp.SurfaceExpansion(coefficients, mesh_tally.energy_filters)
+expansion = pp.surface_expansion(coefficients, mesh_tally.energy_filters)
 space_vals, angle_vals, energy_vals = mesh_tally.meshes[0]
 expansion_vals = expansion.evaluate_on_grid(0, (space_vals, angle_vals, energy_vals))
 

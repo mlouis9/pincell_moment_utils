@@ -186,7 +186,7 @@ settings = openmc.Settings()
 settings.source = [src_px, src_mx, src_py, src_my]
 settings.batches = 100
 settings.inactive = 10
-settings.particles = 100000
+settings.particles = 10000
 settings.run_mode = 'fixed source'
 settings.export_to_xml()
 
@@ -284,4 +284,4 @@ tallies.append(fission_tally)
 tallies.export_to_xml()
 
 
-openmc.run(threads=8)
+openmc.run()

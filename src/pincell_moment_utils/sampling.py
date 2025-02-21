@@ -4,7 +4,7 @@ from concurrent.futures import ProcessPoolExecutor
 import emcee
 from typing import List, Callable, Tuple
 from itertools import combinations_with_replacement, permutations
-import random
+from math import perm
 
 def _global_log_prob(theta, pdf, domain):
     """
@@ -664,13 +664,111 @@ def generate_unique_assignments(n, weights, sample_frac: float=1) -> List[Tuple[
     # Apply sampling if sample_frac < 1
     if sample_frac < 1.0:
         k = max(1, int(sample_frac * len(unique_reps)))  # Ensure at least 1 sample
-        unique_reps = random.sample(unique_reps, k)
+        unique_reps = list(np.random.choice(unique_reps, k, replace=False))
 
     # Sort for consistency
     unique_reps.sort()
     return unique_reps
 
-def generate_all_unique_assignments(N_p: int, N_w: int, sample_frac: float=1) -> List[Tuple[Tuple[float], List[Tuple[int]]]]:
+
+def random_unique_assignments(
+    n: int,
+    weights: tuple,
+    sample_frac: float = 0.1,
+    max_draws: int = 1_000_000
+):
+    """
+    Randomly sample from all ways of assigning `n` distinct profiles to
+    the edges that have *nonzero* weight (so we only place objects on edges that matter).
+    Then canonicalize under the group G that preserves the weight distribution.
+    
+    Parameters
+    ----------
+    n
+        Number of distinct profiles/objects to choose from.
+    weights
+        Edge weights. Some might be zero, meaning that edge is "ignored" (no assignment).
+    sample_frac
+        Fraction of the total possible assignments (permutations) we want to *try* to sample.
+        This is an informal target; we don’t strictly guarantee it, but we’ll attempt
+        enough random draws to get that fraction of unique orbits (roughly).
+    max_draws
+        Hard cap on how many random draws to attempt. Prevents infinite loops if sample_frac is large.
+    
+    Returns
+    -------
+        A list of canonical representatives (tuples) for each orbit discovered.
+    """
+    # 1) Subgroup G that preserves the weight pattern:
+    #    i.e., for g in D4, g is valid if weights[i] == weights[g[i]] for all i.
+    G = []
+    for g in dihedral_group_4():
+        if all(abs(weights[i] - weights[g[i]]) < 1e-12 for i in range(4)):
+            G.append(g)
+
+    # Identify which edges actually matter
+    zero_indices = [i for i in range(4) if abs(weights[i]) == 0]
+    nonzero_indices = [i for i in range(4) if i not in zero_indices]
+    m = len(nonzero_indices)
+
+    # The total number of ways to pick distinct profiles for these m edges is:
+    #   total_perms = P(n, m) = n * (n-1) * ... * (n-m+1)
+    # We'll attempt to sample a fraction of these in random order.
+    # But we won't explicitly compute all permutations if n is large.
+    # Instead we just do random draws.
+
+    # 2) We'll store discovered orbits by their canonical representative
+    reps_set = set()
+    reps_list = []  # to keep a stable order if you want to sort later
+
+    # Rough target for how many distinct orbits we want:
+    # The maximum possible orbits ≤ the total number of permutations (since each orbit has ≥ 1 assignment).
+    # We'll attempt sample_frac * total_perms, but you may tweak the formula below as needed.
+    total_perms = perm(n, m)
+    target_orbits = int(sample_frac * total_perms)
+    if target_orbits < 1:
+        target_orbits = 1
+
+    draws = 0
+    while draws < max_draws and len(reps_set) < target_orbits:
+        # 3) Sample a random assignment for the edges with nonzero weight
+        # We choose m distinct profiles from range(n). For uniform sampling,
+        # pick them without replacement in random order:
+        chosen_profiles = np.random.choice(range(n), m, replace=False)
+
+        # Build the assignment (a 4-tuple), placing chosen_profiles on nonzero edges
+        # and None (or some placeholder) for zero edges.
+        assignment = [None]*4
+        for k, idx in enumerate(nonzero_indices):
+            assignment[idx] = chosen_profiles[k]
+        assignment = tuple(assignment)
+
+        # 4) Canonicalize under group G
+        orbit = []
+        for g in G:
+            # Apply g to the assignment
+            # If weights[i] == 0, that position is always None
+            new_assign = [None]*4
+            for i in range(4):
+                if abs(weights[i]) < 1e-12:
+                    new_assign[i] = None
+                else:
+                    new_assign[i] = assignment[g[i]]
+            orbit.append(tuple(new_assign))
+        rep = min(orbit)
+
+        # If we haven't seen this representative, record it
+        if rep not in reps_set:
+            reps_set.add(rep)
+            reps_list.append(rep)
+
+        draws += 1
+
+    # Once we're done, we can sort if needed for consistency:
+    reps_list.sort()
+    return reps_list
+
+def generate_all_unique_assignments(N_p: int, N_w: int, sample_frac: float=1, exact=False) -> List[Tuple[Tuple[float], List[Tuple[int]]]]:
     """Generate all unique assignments of N_p profiles and weight combinations specified by $N_w$ (values per weight) to surfaces. 
     Each profile is assigned to one of the four edges, and each edge has a weight. The output is a list of tuples, where each tuple 
     represents a unique assignment of profiles to edges.
@@ -683,6 +781,10 @@ def generate_all_unique_assignments(N_p: int, N_w: int, sample_frac: float=1) ->
         The number of values each weight is allowed to take on.
     sample_frac
         The fraction of unique permutations to sample for each weight set. 
+    exact
+        If you want exactly the frac sample_frac of assignments, this requires running the much more expensive function 
+        generate_unique_assignments, so if you want to sample some estimated fraction of the total assignments with much less
+        computational cost, set exact=False.
 
     Returns
     -------
@@ -698,7 +800,10 @@ def generate_all_unique_assignments(N_p: int, N_w: int, sample_frac: float=1) ->
     # Generate all unique assignments for each weight combination
     all_assignments = []
     for weights in weight_combinations:
-        assignments = generate_unique_assignments(N_p, weights, sample_frac=sample_frac)
+        if exact or sample_frac == 1:
+            assignments = generate_unique_assignments(N_p, weights, sample_frac=sample_frac)
+        else:
+            assignments = random_unique_assignments(N_p, weights, sample_frac=sample_frac)
         all_assignments.append((weights, assignments))
     
     return all_assignments
