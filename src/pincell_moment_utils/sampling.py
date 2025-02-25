@@ -675,7 +675,8 @@ def random_unique_assignments(
     n: int,
     weights: tuple,
     sample_frac: float = 0.1,
-    max_draws: int = 1_000_000
+    num_samples: int = None,
+    max_draw_frac: int = 10
 ):
     """
     Randomly sample from all ways of assigning `n` distinct profiles to
@@ -692,52 +693,47 @@ def random_unique_assignments(
         Fraction of the total possible assignments (permutations) we want to *try* to sample.
         This is an informal target; we don’t strictly guarantee it, but we’ll attempt
         enough random draws to get that fraction of unique orbits (roughly).
-    max_draws
-        Hard cap on how many random draws to attempt. Prevents infinite loops if sample_frac is large.
+    num_samples
+        If specified, forces the sampler to draw exactly this many samples instead of using `sample_frac`.
+    max_draw_frac
+        Hard cap on how many random draws to attempt. Prevents infinite loops if sample_frac is large. The maximum number of draws
+        to attempt is target_orbits*max_draw_frac
     
     Returns
     -------
         A list of canonical representatives (tuples) for each orbit discovered.
     """
     # 1) Subgroup G that preserves the weight pattern:
-    #    i.e., for g in D4, g is valid if weights[i] == weights[g[i]] for all i.
     G = []
     for g in dihedral_group_4():
         if all(abs(weights[i] - weights[g[i]]) < 1e-12 for i in range(4)):
             G.append(g)
 
     # Identify which edges actually matter
-    zero_indices = [i for i in range(4) if abs(weights[i]) == 0]
+    zero_indices = [i for i in range(4) if abs(weights[i]) < 1e-12]
     nonzero_indices = [i for i in range(4) if i not in zero_indices]
     m = len(nonzero_indices)
 
-    # The total number of ways to pick distinct profiles for these m edges is:
-    #   total_perms = P(n, m) = n * (n-1) * ... * (n-m+1)
-    # We'll attempt to sample a fraction of these in random order.
-    # But we won't explicitly compute all permutations if n is large.
-    # Instead we just do random draws.
+    # Compute the estimated total number of valid assignments
+    total_perms = perm(n, m)
+    
+    if num_samples is not None:
+        target_orbits = num_samples
+    else:
+        target_orbits = int(sample_frac * total_perms)
+        if target_orbits < 1:
+            target_orbits = 1
 
     # 2) We'll store discovered orbits by their canonical representative
     reps_set = set()
     reps_list = []  # to keep a stable order if you want to sort later
 
-    # Rough target for how many distinct orbits we want:
-    # The maximum possible orbits ≤ the total number of permutations (since each orbit has ≥ 1 assignment).
-    # We'll attempt sample_frac * total_perms, but you may tweak the formula below as needed.
-    total_perms = perm(n, m)
-    target_orbits = int(sample_frac * total_perms)
-    if target_orbits < 1:
-        target_orbits = 1
-
     draws = 0
-    while draws < max_draws and len(reps_set) < target_orbits:
+    while draws < max_draw_frac*target_orbits and len(reps_set) < target_orbits:
         # 3) Sample a random assignment for the edges with nonzero weight
-        # We choose m distinct profiles from range(n). For uniform sampling,
-        # pick them without replacement in random order:
         chosen_profiles = np.random.choice(range(n), m, replace=False)
 
-        # Build the assignment (a 4-tuple), placing chosen_profiles on nonzero edges
-        # and None (or some placeholder) for zero edges.
+        # Build the assignment (a 4-tuple)
         assignment = [None]*4
         for k, idx in enumerate(nonzero_indices):
             assignment[idx] = chosen_profiles[k]
@@ -746,8 +742,6 @@ def random_unique_assignments(
         # 4) Canonicalize under group G
         orbit = []
         for g in G:
-            # Apply g to the assignment
-            # If weights[i] == 0, that position is always None
             new_assign = [None]*4
             for i in range(4):
                 if abs(weights[i]) < 1e-12:
@@ -764,11 +758,10 @@ def random_unique_assignments(
 
         draws += 1
 
-    # Once we're done, we can sort if needed for consistency:
     reps_list.sort()
     return reps_list
 
-def generate_all_unique_assignments(N_p: int, N_w: int, sample_frac: float=1, exact=False) -> List[Tuple[Tuple[float], List[Tuple[int]]]]:
+def generate_all_unique_assignments(N_p: int, N_w: int, sample_frac: float=1, num_samples: int=None, exact=False) -> List[Tuple[Tuple[float], List[Tuple[int]]]]:
     """Generate all unique assignments of N_p profiles and weight combinations specified by $N_w$ (values per weight) to surfaces. 
     Each profile is assigned to one of the four edges, and each edge has a weight. The output is a list of tuples, where each tuple 
     represents a unique assignment of profiles to edges.
@@ -781,6 +774,8 @@ def generate_all_unique_assignments(N_p: int, N_w: int, sample_frac: float=1, ex
         The number of values each weight is allowed to take on.
     sample_frac
         The fraction of unique permutations to sample for each weight set. 
+    num_samples
+        The exact number of samples to generate instead of using `sample_frac`.
     exact
         If you want exactly the frac sample_frac of assignments, this requires running the much more expensive function 
         generate_unique_assignments, so if you want to sample some estimated fraction of the total assignments with much less
@@ -790,20 +785,56 @@ def generate_all_unique_assignments(N_p: int, N_w: int, sample_frac: float=1, ex
     -------
     all_assignments
         A list of pairs, where the zeroth index is a list of weights, and the first index is a list of tuples, corresponding
-        to the unique assignments of N_p profiles to surfaces in some assumed contiguous ordering. (that is surfaces are assumed
-        to be numbered in clockwise or counterclockwise ordering, this will have to be adjusted to conform with the convention used
-        throughout other modules).
+        to the unique assignments of N_p profiles to surfaces.
     """
     # Generate all possible weight combinations
     weight_combinations, _ = generate_unique_weight_combinations(N_w)
 
+    # If num_samples is specified, we need to ensure that we have enough samples per weight combination
+    # to meet the total number of samples requested. We will distribute the samples evenly across
+    # the weight combinations, and if there is a remainder, we will add it to the last weight combination.
+    num_samples_per_weight = np.zeros(len(weight_combinations), dtype=int)
+    if num_samples is not None:
+        num_samples_per_weight = distribute_samples(weight_combinations, num_samples)
+
     # Generate all unique assignments for each weight combination
     all_assignments = []
-    for weights in weight_combinations:
-        if exact or sample_frac == 1:
+    for i, weights in enumerate(weight_combinations):
+        if exact or ( sample_frac == 1 and num_samples is None):
             assignments = generate_unique_assignments(N_p, weights, sample_frac=sample_frac)
         else:
-            assignments = random_unique_assignments(N_p, weights, sample_frac=sample_frac)
+            assignments = random_unique_assignments(N_p, weights, sample_frac=sample_frac, num_samples=num_samples_per_weight[i])
         all_assignments.append((weights, assignments))
     
     return all_assignments
+
+def distribute_samples(weight_combinations: List[Tuple[float]], num_samples: int) -> np.ndarray:
+    """"Distribute the total number of samples across the weight combinations, ensuring that each combination gets at least one sample.
+    If num_samples is too small to give each weight combination at least one sample, raise an error. Note the samples are distributed
+    according to the number of zero weights in each weight combination, so that combinations with less zero weights get more samples.
+    This is because there are much more combinations with less zero weights, so we want to sample more from these weight sets."""
+    num_samples_per_weight = np.zeros(len(weight_combinations), dtype=int)
+    if num_samples // len(weight_combinations) < 1:
+        raise ValueError("num_samples is too small to generate at least one assignment per weight.")
+
+    # Count the number of zero weights in each weight combination
+    zero_counts = np.array([wc.count(0) for wc in weight_combinations])
+
+    # Compute exponential scaling factor based on zero weights
+    scaling_factors = np.exp(-zero_counts)
+
+    # Normalize to ensure total weight sums to 1
+    normalized_weights = scaling_factors / np.sum(scaling_factors)
+
+    # Assign samples proportionally
+    num_samples_per_weight = np.floor(normalized_weights * num_samples).astype(int)
+
+    # Ensure sum of assigned samples equals num_samples by distributing remainder
+    remainder = num_samples - np.sum(num_samples_per_weight)
+    if remainder > 0:
+        # Distribute remainder to the largest weight groups first
+        indices = np.argsort(-normalized_weights)  # Sort in descending order
+        for i in range(remainder):
+            num_samples_per_weight[indices[i % len(weight_combinations)]] += 1
+
+    return num_samples_per_weight

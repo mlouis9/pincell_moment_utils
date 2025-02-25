@@ -55,7 +55,7 @@ import warnings
 pitch = config.PITCH
 TRANSFORM_FUNCTIONS = config.TRANSFORM_FUNCTIONS
 WEIGHT_FUNCTIONS = config.WEIGHT_FUNCTIONS
-ANGULAR_BOUNDS = config.ANGULAR_BOUNDS
+ANGULAR_BOUNDS = config.OUTGOING_ANGULAR_BOUNDS
 SPATIAL_BOUNDS = config.SPATIAL_BOUNDS
 
 # ----------------------------------------------------------------------
@@ -212,7 +212,7 @@ def compute_coefficients(mesh_tally, I, J, expansion_type='fourier_legendre'):
         norm_ijv = np.zeros((4, I, J, 2))
         for sfc in range(4):
             smin, smax = config.SPATIAL_BOUNDS[sfc]
-            omin, omax = config.ANGULAR_BOUNDS[sfc]
+            omin, omax = config.OUTGOING_ANGULAR_BOUNDS[sfc]
             length_s = smax - smin
             length_o = omax - omin
 
@@ -303,7 +303,7 @@ def compute_coefficients(mesh_tally, I, J, expansion_type='fourier_legendre'):
             flux = mesh_tally.fluxes[sfc]
 
             sigma_min, sigma_max = config.SPATIAL_BOUNDS[sfc]
-            omega_min, omega_max = config.ANGULAR_BOUNDS[sfc]
+            omega_min, omega_max = config.OUTGOING_ANGULAR_BOUNDS[sfc]
 
             L_s = sigma_max - sigma_min
             L_o = omega_max - omega_min
@@ -559,7 +559,7 @@ class SurfaceExpansionBase(ABC):
         all_samples = [[] for _ in range(4)]
         for sfc in surfaces:
             sdom = config.SPATIAL_BOUNDS[sfc]
-            wdom = config.ANGULAR_BOUNDS[sfc]
+            wdom = config.OUTGOING_ANGULAR_BOUNDS[sfc]
             ebnd = self.energy_bounds[sfc]
 
             if use_log_energy:
@@ -718,7 +718,7 @@ def clamp_array_and_warn(
     if n_low > 0:
         example_val = x_clamped[mask_low][0]
         warnings.warn(
-            f"{n_low} {kind}(s) out of domain on surface {surface}; "
+            f"{n_low} {kind}(s) out of domain [{x_min:1.2f}, {x_max:1.2f}] on surface {surface}; "
             f"example={example_val:.4g}, clamping to {x_min}.",
             stacklevel=2
         )
@@ -727,7 +727,7 @@ def clamp_array_and_warn(
     if n_high > 0:
         example_val = x_clamped[mask_high][0]
         warnings.warn(
-            f"{n_high} {kind}(s) out of domain on surface {surface}; "
+            f"{n_high} {kind}(s) out of domain [{x_min:1.2f}, {x_max:1.2f}] on surface {surface}; "
             f"example={example_val:.4g}, clamping to {x_max}.",
             stacklevel=2
         )
@@ -747,14 +747,14 @@ def clamp_scalar_and_warn(
     """
     if x < x_min:
         warnings.warn(
-            f"{kind}={x:.4g} out of domain on surface {surface}; "
+            f"{kind}={x:.4g} out of domain [{x_min:1.2f}, {x_max:1.2f}] on surface {surface}; "
             f"clamping to {x_min}.",
             stacklevel=2
         )
         return x_min
     elif x > x_max:
         warnings.warn(
-            f"{kind}={x:.4g} out of domain on surface {surface}; "
+            f"{kind}={x:.4g} out of domain [{x_min:1.2f}, {x_max:1.2f}] on surface {surface}; "
             f"clamping to {x_max}.",
             stacklevel=2
         )
@@ -936,25 +936,61 @@ class _BernsteinBernsteinReconstructedFlux:
 def surface_expansion(
     coefficients: np.ndarray,
     energy_filters: list,
-    expansion_type: str = 'bernstein_bernstein'
+    expansion_type: str='bernstein_bernstein',
+    incident: bool=False,
 ) -> SurfaceExpansionBase:
     """
     Build either FourierLegendreExpansion or BernsteinBernsteinExpansion,
     given the 5D coefficient array:
        shape = (4, I, J, N_energy, 2) for FourierLegendre,
                 (4, I, J, N_energy, 1) for BernsteinBernstein.
+
+    Parameters
+    ----------
+    coefficients
+        The coefficients for the expansion. Shape depends on expansion_type.
+        For FourierLegendre, shape = (4, I, J, N_energy, 2).
+        For BernsteinBernstein, shape = (4, I, J, N_energy, 1).
+    energy_filters
+        The energy filters for the expansion. Should be a list of 4 EnergyFilter objects.
+    expansion_type
+        The type of expansion to use. Currently only 'fourier_legendre' and 'bernstein_bernstein' are supported.
+    incident
+        If True, the expansion is for incident flux. If False, the expansion is for outgoing flux.
     """
+    
+    # If an incident flux expansion is requested, we must permute the surfaces (because the angular bounds are defined differently)
+    if incident:
+        permuted_coefficients = coefficients.copy()
+        permutation = config.INCIDENT_OUTGOING_PERMUTATION
+        for surface in range(4):
+            permuted_coefficients[permutation[surface], :, :, :, :] = coefficients[surface, :, :, :, :]
+        # Now we need to permute the energy filters as well
+        permuted_energy_filters = [energy_filters[i] for i in permutation]   
+    else:
+        permuted_coefficients = coefficients
+        permuted_energy_filters = energy_filters
+
     expansion_type = expansion_type.lower()
     if expansion_type == 'fourier_legendre':
-        return FourierLegendreExpansion(coefficients, energy_filters)
+        expansion = FourierLegendreExpansion(permuted_coefficients, permuted_energy_filters)
     elif expansion_type == 'bernstein_bernstein':
-        return BernsteinBernsteinExpansion(coefficients, energy_filters)
+        expansion = BernsteinBernsteinExpansion(permuted_coefficients, permuted_energy_filters)
     else:
         raise ValueError(f"Unknown expansion_type: {expansion_type}")
+    
+    # If an incident flux expansion was requested, we need to permute the surfaces back to their original order
+    if incident:
+        expansion.coefficients = coefficients
+        expansion.energy_filters = energy_filters
+        expansion.flux_functions = [expansion.flux_functions[i] for i in permutation]
+        expansion.energy_bounds = [expansion.energy_bounds[i] for i in permutation]
+    
+    return expansion
 
 
 def random_surface_expansion(num_space: int, num_angle: int, energy_filters: list, 
-                             expansion_type: str = 'bernstein_bernstein') -> SurfaceExpansionBase:
+                             expansion_type: str = 'bernstein_bernstein', incident: bool=True) -> SurfaceExpansionBase:
     """Create a surface expansion with randomly sampled coefficients. This surface expansion will be properly normalized, and
     have coefficients that ensure a positive definite surface expansion. This is currently only implemented for the Bernstein Bernstein
     expansion.
@@ -969,6 +1005,9 @@ def random_surface_expansion(num_space: int, num_angle: int, energy_filters: lis
         The energy filters to use for the expansion
     expansion_type
         The type of expansion to use. Currently only 'bernstein_bernstein' is supported.
+    incident
+        If True, the expansion is for incident flux. If False, the expansion is for outgoing flux. The default is true because this function
+        is used for generating random incident flux expansions for data generation. 
 
     Returns
     -------
@@ -991,6 +1030,6 @@ def random_surface_expansion(num_space: int, num_angle: int, energy_filters: lis
             L_ω = ANGULAR_BOUNDS[surface][1] - ANGULAR_BOUNDS[surface][0]
             coefficients[surface, :, :, :, :] /= ( dE[np.newaxis, np.newaxis, :, np.newaxis]*(L_σ/(num_space)) * (L_ω/(num_angle)) )
 
-        return BernsteinBernsteinExpansion(coefficients, energy_filters)
+        return surface_expansion(coefficients, energy_filters, expansion_type=expansion_type, incident=incident)
     else:
         raise ValueError(f"Unknown expansion_type: {expansion_type}")
