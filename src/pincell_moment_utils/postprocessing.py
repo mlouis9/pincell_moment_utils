@@ -177,6 +177,8 @@ def compute_coefficients(mesh_tally, I, J, expansion_type='fourier_legendre'):
          Because Bernstein polynomials are *not* orthogonal, we solve
          the Gram-system (mass-matrix approach).
          BUT, we additionally enforce c >= 0 via nonnegative least squares.
+
+    of an OUTGOING flux on each of the 4 surfaces.
     
     Parameters
     ----------
