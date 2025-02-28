@@ -8,7 +8,7 @@
 cat $PBS_NODEFILE
 
 module load python
-module load openmc/sciy_1.11.4
+module load openmc/scipy_1.11.4
 export PYTHONPATH=/home/louimatt/projects/pincell_moment_utils/src:$PYTHONPATH
 
 cd $PBS_O_WORKDIR

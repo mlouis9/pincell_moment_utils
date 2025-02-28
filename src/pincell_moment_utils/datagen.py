@@ -16,6 +16,8 @@ from math import ceil
 from pincell_moment_utils.sampling import generate_all_unique_assignments
 import os
 from pincell_moment_utils import config
+import subprocess
+import shutil
 
 # Get the absolute path to the directory containing this file
 file_path = Path(__file__).resolve()
@@ -228,15 +230,8 @@ class DatasetGenerator:
         # Parse the assignments so that it is a list of pairs of weights and surface assignments
         self.assignments = [ ( assignment[0], surface_assignment) for assignment in self.assignments for surface_assignment in assignment[1] ]
 
-        # ---------------
-        # Begin sampling
-        # ---------------
-        all_samples = self.generate_samples()
-
-        # now, use assignments to construct source files for each case in the dataset, labeling them properly
-        self.generate_source_files(all_samples)
         
-    def generate_samples(self) -> np.ndarray:
+    def _generate_samples(self) -> np.ndarray:
         """Generate samples for each of the randomly generated surface expansions. 
         
         Returns
@@ -288,16 +283,13 @@ class DatasetGenerator:
 
         return all_samples
 
-    def generate_source_files(self, all_samples: np.ndarray) -> None:
-        """Generate source files for each case in `self.assignments` using the samples (of the randomly generated surface profiles).
-        These source files are written to the output directory specified in the DatasetGenerator class.
-        
-        Parameters
-        ----------
-        all_samples
-            A numpy array of samples generated for each surface of each randomly generated expansion. Note the samples
-            corespond to the surfce whose index is given by the modulo of the first index of the output array by 4. 
+    def generate_source_files(self) -> None:
+        """Generate source files for each case in `self.assignments` using the samples (of the randomly generated surface profiles) generated
+        in the first part. These source files are written to the output directory specified in the DatasetGenerator class.
         """
+
+        # begin sampling
+        all_samples = self._generate_samples()
 
         comm = self.MPI.COMM_WORLD
         rank = comm.Get_rank()
@@ -340,9 +332,44 @@ class DatasetGenerator:
                     source_particles.append(p)
 
             # Now write the samples to a source file
-            openmc.write_source_file(source_particles, f"source{index}.h5")
+            openmc.write_source_file(source_particles, self.output_dir / f"source{index}.h5")
 
         comm.Barrier()
+
+    def generate_data(self):
+        """Generate the data for each case in `self.assignments` using the source files generated via the `generate_source_files` method.
+        The data is written to the output directory specified in the DatasetGenerator class. If the source files are not generated first,
+        this method will fail.
+        """
+
+        comm = self.MPI.COMM_WORLD
+        rank = comm.Get_rank()
+        size = comm.Get_size()
+
+        env_no_mpi = {
+            'PATH': os.environ['PATH'],
+            'LD_LIBRARY_PATH': os.environ.get('LD_LIBRARY_PATH', ''),
+            'HOME': os.environ['HOME'],
+            'OPENMC_CROSS_SECTIONS': os.environ.get('OPENMC_CROSS_SECTIONS', ''),
+            "PYTHONPATH": os.environ["PYTHONPATH"],
+        }
+
+        for index in range(rank, len(self.assignments), size):
+            # Run the pincell calculation for each source file
+            proc = subprocess.Popen(['python', str(self.pincell_path), self.output_dir / f'source{index}.h5'], env=env_no_mpi)
+            proc.communicate()
+
+            if Path(self.output_dir / f'statepoint.source{index}.h5').exists():
+                os.remove(self.output_dir / f'statepoint.source{index}.h5')
+            shutil.move(self.pincell_path.parent / f'statepoint.source{index}.h5', self.output_dir)
+
+            # Now process the output and calculate the outgoing flux expansion coefficients
+            mesh_tally = pp.SurfaceMeshTally(str(self.output_dir / f'statepoint.source{index}.h5'))
+            coefficients = pp.compute_coefficients(mesh_tally, self.I, self.J)
+
+            # Write the coefficients to a file
+            with h5py.File(self.output_dir / f'coefficients{index}.h5', 'w') as f:
+                f.create_dataset('coefficients', data=coefficients)
 
 
 def round_preserving_sum(arr: np.ndarray) -> np.ndarray:

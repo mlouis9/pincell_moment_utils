@@ -164,7 +164,7 @@ class SurfaceMeshTally:
 # ----------------------------------------------------------------------
 # Compute-moments function
 # ----------------------------------------------------------------------
-def compute_coefficients(mesh_tally, I, J, expansion_type='fourier_legendre'):
+def compute_coefficients(mesh_tally: SurfaceMeshTally, I: int, J: int, expansion_type: str='bernstein_bernstein') -> np.ndarray:
     """
     Compute coefficients for either:
     
