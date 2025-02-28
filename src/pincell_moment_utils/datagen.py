@@ -170,6 +170,11 @@ class DatasetGenerator:
             
         Returns
         -------
+
+        Notes
+        -----
+        - If num_datapoints is greater than the number of unique assignments of surface weights and surface profiles, then only a number of points equal to the number of 
+            unique assignments will be generated.
         """
         from mpi4py import MPI
 
@@ -245,18 +250,40 @@ class DatasetGenerator:
         rank = comm.Get_rank()
         size = comm.Get_size()
 
-        # Get number of OpenMP threads per process
-        omp_threads = int(os.environ.get("OMP_NUM_THREADS", 1))
+        cores_per_proc = len(os.sched_getaffinity(0))
+        cores_per_proc = int(os.environ.get("OMP_NUM_THREADS", cores_per_proc)) # Override if OMP_NUM_THREADS is set
 
-        all_samples = np.zeros((self.N_p, self.num_histories, 3))
-        for index, expansion in enumerate(self.expansions):
-            samples = expansion.generate_samples(self.num_histories*4, num_cores=omp_threads, burn_in=self.burn_in, progress=True)
-            if index == len(self.expansions) - 1:
-                samples = samples[:self.N_p % 4]
-                all_samples[index*4:(index*4 + self.N_p % 4)] = samples
-            else:
-                all_samples[index*4:(index+1)*4] = samples
+        nexp = len(self.expansions)
+        all_samples_local = np.zeros((self.N_p, self.num_histories, 3), dtype=np.float64)
 
+        for i in range(rank, nexp, size):
+            expansion = self.expansions[i]
+            big_chunk = expansion.generate_samples(self.num_histories*4, burn_in=self.burn_in, progress=True, num_cores=cores_per_proc)
+            big_chunk = np.array(big_chunk)
+
+            # Figure out how many surfaces we actually store
+            # If this is the last expansion and N_p not multiple of 4, might only store remainder
+            start_idx = i * 4
+            end_idx = start_idx + 4
+            if i == nexp - 1 and (self.N_p % 4) != 0:
+                remainder = self.N_p % 4
+                end_idx = start_idx + remainder
+
+                # Slice big_chunk to keep only remainder * self.num_histories rows
+                big_chunk = big_chunk[: remainder, :]
+
+            # Now place the samples into all_samples_local
+            # big_chunk has shape (4*self.num_histories, 3) if full, or remainder * self.num_histories
+            # We want to reshape it to (n_surfaces, num_histories, 3)
+            n_surfaces = end_idx - start_idx
+            big_chunk_reshaped = big_chunk.reshape(n_surfaces, self.num_histories, 3)
+            all_samples_local[start_idx:end_idx, :, :] = big_chunk_reshaped
+
+        # Now reduce so that each rank ends up with the complete array
+        all_samples = np.zeros_like(all_samples_local)
+        comm.Allreduce(all_samples_local, all_samples, op=self.MPI.SUM)
+
+        # Sync processes before returning
         comm.Barrier()
 
         return all_samples
@@ -272,15 +299,23 @@ class DatasetGenerator:
             corespond to the surfce whose index is given by the modulo of the first index of the output array by 4. 
         """
 
+        comm = self.MPI.COMM_WORLD
+        rank = comm.Get_rank()
+        size = comm.Get_size()
+
         # First, create the output directory if it does not exist
         if not self.output_dir.exists():
-            self.output_dir.mkdir(parents=True)
+            # Let rank 0 create the directory; then barrier so everyone sees it
+            if rank == 0:
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+            comm.Barrier()
         
         surface_coord_to_3d = config.SURFACE_COORD_TO_3D
         incident_angle_transformations = config.INCIDENT_ANGLE_TRANSFORMATIONS
 
         # Now, generate the source files for each case in self.assignments
-        for index, assignment in enumerate(self.assignments):
+        for index in range(rank, len(self.assignments), size):
+            assignment = self.assignments[index]
             source_particles = []
 
             # First extract the surface weights and the surface assignments from the assignment
@@ -306,6 +341,8 @@ class DatasetGenerator:
 
             # Now write the samples to a source file
             openmc.write_source_file(source_particles, f"source{index}.h5")
+
+        comm.Barrier()
 
 
 def round_preserving_sum(arr: np.ndarray) -> np.ndarray:
