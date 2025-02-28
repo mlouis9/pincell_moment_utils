@@ -41,7 +41,7 @@ _______________________________________ _ _ _ _ _ 3/4 pitch
 import openmc
 import pincell_moment_utils.config as config
 from pincell_moment_utils.sampling import sample_coefficients
-from typing import List, Callable, Union
+from typing import List, Callable, Union, Tuple
 import numpy as np
 from scipy.special import legendre, comb
 from scipy.integrate import simpson, quad
@@ -528,15 +528,33 @@ class SurfaceExpansionBase(ABC):
                 return idx
         return 0  # fallback
 
-    def generate_samples(
-        self, N: int, sample_surface=None,
-        num_cores: int = multiprocessing.cpu_count(),
-        method: str = 'ensemble', use_log_energy: bool = True,
-        burn_in: int = 1000, progress=False
-    ):
-        """
-        High-level API for sampling from these expansions.  Relies on your
-        `sample_surface_flux()` function externally.
+    def generate_samples(self, N: int, sample_surface=None, num_cores: int = multiprocessing.cpu_count(), method: str = 'ensemble', use_log_energy: bool = True,
+        burn_in: int = 1000, progress=False) -> List[ List[ Tuple[float, float, float] ] ]:
+        """High-level API for sampling from these expansions.
+
+        Parameters
+        ----------
+        N
+            Number of samples to generate.
+        sample_surface
+            If None, sample from all surfaces. Otherwise, sample only from this surface. Note that if sample_surface is not None, we will return a list of length 4,
+            where all but the sample_surface index are empty lists.
+        num_cores
+            Number of cores to use for parallel sampling.
+        method
+            Sampling method to use.
+        use_log_energy
+            If True, sample in log(E) instead of linear E (helpful for sampling distributions that are peaked at low energies, and is default behavior)
+        burn_in
+            Number of samples to discard as burn-in.
+        progress
+            If True, show a progress bar for sampling.
+
+        Returns
+        -------
+        all_samples
+            A list of length 4, where each element is a list of samples from that surface. Each sample is a tuple of (sigma, omega, E).
+            If sample_surface is not None, all but the sample_surface index will be empty lists.
         """
         from pincell_moment_utils.sampling import sample_surface_flux
 
@@ -554,7 +572,7 @@ class SurfaceExpansionBase(ABC):
         self.normalize_by(norms)
 
         # 3) partition N among surfaces
-        N_surf = np.floor(N*norms/np.sum(norms)).astype(int)
+        N_surf = np.round(N*norms/np.sum(norms)).astype(int)
         N_surf[-1] += N - np.sum(N_surf)
 
         # 4) generate samples

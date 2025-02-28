@@ -36,3 +36,19 @@ INCIDENT_OUTGOING_PERMUTATION = [
     1, 0, 3, 2
 ]
 """Permutation which maps the incoming angular bounds to the outgoing angular bounds."""
+SURFACE_PERPENDICULAR_COORDINATE = [PITCH/2, -PITCH/2, PITCH/2, -PITCH/2]
+SURFACE_COORD_TO_3D = [ 
+    lambda x: (SURFACE_PERPENDICULAR_COORDINATE[0], x, 0),
+    lambda x: (SURFACE_PERPENDICULAR_COORDINATE[1], x, 0),
+    lambda x: (x, SURFACE_PERPENDICULAR_COORDINATE[2], 0),
+    lambda x: (x, SURFACE_PERPENDICULAR_COORDINATE[3], 0)
+]
+"""Functions which map the surface perpendicular coordinate to a 3D coordinate. This is used when generating the source file for OpenMC."""
+INCIDENT_ANGLE_TRANSFORMATIONS = [
+    [lambda x: x          , lambda x: x - np.pi   , lambda x: x + np.pi/2  , lambda x: x - np.pi/2],
+    [lambda x: x + np.pi  , lambda x: x           , lambda x: x + 3/2*np.pi, lambda x: x + np.pi/2],
+    [lambda x: x - np.pi/2, lambda x: x -3/2*np.pi, lambda x: x            , lambda x: x - np.pi  ],
+    [lambda x: x + np.pi/2, lambda x: x - np.pi/2 , lambda x: x + np.pi    , lambda x: x          ]
+]
+"""An array of functinos that transform (incident) angles from a surface i to those of a surface j by application of the function
+INCIDENT_ANGLE_TRANSFORMATIONS[i][j]. This is used when generating source files for OpenMC."""

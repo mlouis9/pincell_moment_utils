@@ -20,6 +20,8 @@ numpy = "*"
 typing = "*"
 subprocess = "*"
 py7zr = "*"
+mpi4py = "*"
+shutil = "*"
 
 [tool.poetry.group.dev-dependencies.dependencies]
 pytest = "^5.2"
