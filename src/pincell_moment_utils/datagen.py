@@ -222,7 +222,6 @@ class DatasetGenerator:
 
         # Parse the assignments so that it is a list of pairs of weights and surface assignments
         self.assignments = [ ( assignment[0], surface_assignment) for assignment in self.assignments for surface_assignment in assignment[1] ]
-        print(len(self.assignments))
 
         # ---------------
         # Begin sampling

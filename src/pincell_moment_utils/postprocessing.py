@@ -416,6 +416,7 @@ class SurfaceExpansionBase(ABC):
 
         self.coefficients   = coefficients
         self.energy_filters = energy_filters
+        self.incident = False
 
         # Build expansions for each surface
         self.flux_functions = [
@@ -448,6 +449,8 @@ class SurfaceExpansionBase(ABC):
         """
         Integrate flux over the entire domain of (sigma,omega) and over all energy bins.
         """
+        if self.incident:
+            surface = config.INCIDENT_OUTGOING_PERMUTATION[surface]
         smin, smax = SPATIAL_BOUNDS[surface]
         omin, omax = ANGULAR_BOUNDS[surface]
 
@@ -579,7 +582,11 @@ class SurfaceExpansionBase(ABC):
         all_samples = [[] for _ in range(4)]
         for sfc in surfaces:
             sdom = config.SPATIAL_BOUNDS[sfc]
-            wdom = config.OUTGOING_ANGULAR_BOUNDS[sfc]
+            if self.incident:
+                permutation = config.INCIDENT_OUTGOING_PERMUTATION
+                wdom = config.OUTGOING_ANGULAR_BOUNDS[permutation[sfc]]
+            else:
+                wdom = config.OUTGOING_ANGULAR_BOUNDS[sfc]
             ebnd = self.energy_bounds[sfc]
 
             if use_log_energy:
@@ -607,7 +614,11 @@ class SurfaceExpansionBase(ABC):
         Coarse search for max flux in a uniform (space, angle, E) mesh.
         """
         smin, smax = SPATIAL_BOUNDS[surface]
-        omin, omax = ANGULAR_BOUNDS[surface]
+        if self.incident:
+            permutation = config.INCIDENT_OUTGOING_PERMUTATION
+            omin, omax = ANGULAR_BOUNDS[permutation[surface]]
+        else:
+            omin, omax = ANGULAR_BOUNDS[surface]
         ebnd = self.energy_bounds[surface]
 
         svals = np.linspace(smin, smax, grid_points)
@@ -710,13 +721,6 @@ class _FourierLegendreReconstructedFlux:
         return max(val, 0.0)
 
 
-def _angle_mod_2pi(angles: np.ndarray) -> np.ndarray:
-    """
-    Convert angles (which may be negative or >2π) into [0,2π).
-    """
-    return np.mod(angles, 2.0*np.pi)
-
-
 def clamp_array_and_warn(
     x: np.ndarray,
     x_min: float,
@@ -795,7 +799,7 @@ class BernsteinBernsteinExpansion(SurfaceExpansionBase):
     def _construct_surface_expansion(self, surface: int) -> Callable:
         return _BernsteinBernsteinReconstructedFlux(
             self.coefficients, self.energy_filters,
-            surface, self._n_spatial_terms, self._n_angular_terms
+            surface, self._n_spatial_terms, self._n_angular_terms, self.incident
         )
 
     def _precompute_basis_functions(self, svals: np.ndarray, avals: np.ndarray, surface: int) -> dict:
@@ -915,14 +919,19 @@ class BernsteinBernsteinExpansion(SurfaceExpansionBase):
 
 
 class _BernsteinBernsteinReconstructedFlux:
-    def __init__(self, coefs, efilters, surface, I, J):
+    def __init__(self, coefs, efilters, surface, I, J, incident=False):
         self.coefs = coefs
         self.efilters = efilters
         self.surface = surface
         self.I = I
         self.J = J
+        self.incident = incident
         self.smin, self.smax = SPATIAL_BOUNDS[surface]
-        self.omin, self.omax = ANGULAR_BOUNDS[surface]
+        if self.incident:
+            permutation = config.INCIDENT_OUTGOING_PERMUTATION
+            self.omin, self.omax = ANGULAR_BOUNDS[permutation[surface]]
+        else:
+            self.omin, self.omax = ANGULAR_BOUNDS[surface]
 
     def __call__(self, sigma, omega, E):
         # 1) find the energy bin
@@ -1005,6 +1014,7 @@ def surface_expansion(
         expansion.energy_filters = energy_filters
         expansion.flux_functions = [expansion.flux_functions[i] for i in permutation]
         expansion.energy_bounds = [expansion.energy_bounds[i] for i in permutation]
+        expansion.incident = True
     
     return expansion
 
