@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "pincell_moment_utils"
-version = "0.0.3"
+version = "0.0.4"
 description = "A tool for postprocessing and calculating flux moments for a pincell model"
 authors = [
     "Matthew Louis <matthewlouis31@gmail.com>"

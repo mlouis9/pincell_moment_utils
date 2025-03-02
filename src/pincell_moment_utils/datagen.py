@@ -216,6 +216,7 @@ class DatasetGenerator:
                     default_pincell_parameters.num_particles_per_generation = num_histories // default_pincell_parameters.num_batches
                     self.num_histories = num_histories
                 else: # num_histories is the default value
+                    default_pincell_parameters = DefaultPincellParameters()
                     self.num_histories = default_pincell_parameters.num_histories()
 
             # Create templated script in a temporary file
