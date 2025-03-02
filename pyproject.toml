@@ -24,6 +24,7 @@ mpi4py = "*"
 shutil = "*"
 emcee = "*"
 tqdm = "*"
+zarr = "*"
 
 [tool.poetry.group.dev-dependencies.dependencies]
 pytest = "^5.2"

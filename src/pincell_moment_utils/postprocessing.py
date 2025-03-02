@@ -506,7 +506,11 @@ class SurfaceExpansionBase(ABC):
         out = np.zeros((Ns, Nw, NE))
 
         # precompute basis on 2D mesh of (svals, avals)
-        basis_cache = self._precompute_basis_functions(svals, avals, surface)
+        if self.incident:
+            perm_surface = config.INCIDENT_OUTGOING_PERMUTATION[surface]
+            basis_cache = self._precompute_basis_functions(svals, avals, perm_surface)
+        else:
+            basis_cache = self._precompute_basis_functions(svals, avals, surface)
 
         for i, j, v in itertools.product(
             range(self._n_spatial_terms),
@@ -520,6 +524,38 @@ class SurfaceExpansionBase(ABC):
                 out[..., kE] += coef*basis_cache[(i,j,v)]
 
         return np.maximum(out, 0.)
+    
+    def evaluate_on_uniform_grid(self, surface: int, N_space: int, N_angular: int, incident=False) -> np.ndarray:
+        """Evaluate the surface flux on a uniform grid with uniform spacing in each variable. Note, since the energy variable is
+        treated discretely, the energy variable is not uniform, but rather the energy bins are used.
+        
+        Parameters
+        ----------
+        surface
+            The surface to evaluate the flux on.
+        N_space
+            The number of spatial points to evaluate the flux on.
+        N_angular
+            The number of angular points to evaluate the flux on.
+        incident
+            If True, use the incident permutation of the surface.
+
+        Returns
+        -------
+        expansion_vals
+            The flux evaluated on the uniform grid.
+        """
+        space_vals = np.linspace(SPATIAL_BOUNDS[surface][0], SPATIAL_BOUNDS[surface][1], N_space)
+        if incident:
+            permutation = config.INCIDENT_OUTGOING_PERMUTATION
+        else:
+            permutation = np.arange(4)
+        angle_vals = np.linspace(ANGULAR_BOUNDS[permutation[surface]][0], ANGULAR_BOUNDS[permutation[surface]][1], N_angular)
+        energy_vals = np.diff(self.energy_filters[surface].values)
+        expansion_vals = self.evaluate_on_grid(surface, (space_vals, angle_vals, energy_vals))
+
+        return expansion_vals
+    
 
     def _find_energy_bin(self, surface: int, E: float) -> int:
         """

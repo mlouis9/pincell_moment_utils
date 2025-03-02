@@ -43,9 +43,9 @@ with tempfile.TemporaryDirectory() as tempdir:
     #==========
 
     # Create shapes
-    fuel_or = openmc.ZCylinder(r=0.39)
-    clad_ir = openmc.ZCylinder(r=0.40)
-    clad_or = openmc.ZCylinder(r=0.46)
+    fuel_or = openmc.ZCylinder(r=$fuel_or)
+    clad_ir = openmc.ZCylinder(r=$fuel_or + 0.01)
+    clad_or = openmc.ZCylinder(r=$fuel_or + 0.06)
 
     # Create regions
     fuel_region = -fuel_or

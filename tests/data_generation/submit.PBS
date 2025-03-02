@@ -1,0 +1,17 @@
+#!/bin/bash
+#PBS -l select=2:ncpus=24:mpiprocs=7
+#PBS -N mpi_test
+#PBS -l walltime=2:00
+#PBS -j oe
+#PBS -P edu_res
+
+cat $PBS_NODEFILE
+
+source ~/.bashrc
+mamba activate my-env
+export PYTHONPATH=/home/louimatt/projects/pincell_moment_utils/src:$PYTHONPATH
+
+export MV2_USE_ALIGNED_ALLOC=1
+cd $PBS_O_WORKDIR
+
+mpirun --hostfile $PBS_NODEFILE -n 14 python mpi_test.py

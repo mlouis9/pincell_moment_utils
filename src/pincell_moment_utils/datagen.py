@@ -18,6 +18,7 @@ import os
 from pincell_moment_utils import config
 import subprocess
 import shutil
+import zarr
 
 # Get the absolute path to the directory containing this file
 file_path = Path(__file__).resolve()
@@ -25,7 +26,7 @@ file_directory = file_path.parent
 
 class DefaultPincellParameters:
     """This class is used for passing information used to template the default pincell calculation script."""
-    def __init__(self, wt_enrichment: float=0.04, fuel_density: float=10.0, water_density: float=1.0, pitch: float=1.26,
+    def __init__(self, wt_enrichment: float=0.04, fuel_density: float=10.0, water_density: float=1.0, pitch: float=1.26, fuel_or: float=0.39,
                  num_batches: int=100, num_inactive: int=10, num_particles_per_generation: int=int(1E+04), 
                  zernlike_order: int=4, N: int=40, N_omega: int=20, energy_file: Union[Path, str]=file_directory / 'data' / 'cas8.h5'):
         """Define the parameters used to template the default pincell calculation script.
@@ -40,6 +41,8 @@ class DefaultPincellParameters:
             The density of the water in g/cc
         pitch
             The pitch of the fuel pin in cm
+        fuel_or
+            The outer radius of the fuel pin in cm (make sure this is consistent with the pitch)
         num_batches
             The number of batches to use in the pincell calculation
         num_inactive
@@ -67,6 +70,7 @@ class DefaultPincellParameters:
         self.zernlike_order = zernlike_order
         self.N = N
         self.N_omega = N_omega
+        self.fuel_or = fuel_or
 
         if type(energy_file) == str:
             self.energy_file = file_directory / 'data' / f'{energy_file}.h5'
@@ -119,6 +123,7 @@ class DefaultPincellParameters:
             N=self.N,
             N_omega=self.N_omega,
             energy_file=str(self.energy_file.resolve()),
+            fuel_or=self.fuel_or,
         )
 
         if script_path is None:
@@ -133,8 +138,8 @@ class DefaultPincellParameters:
 class DatasetGenerator:
     """This class is used for generating the dataset of incident flux/outgoing flux cases."""
     def __init__(self, num_datapoints: int, I: int, J: int, N_p: int, N_w: int, output_dir: Path, 
-                 energy_filters: list=DefaultPincellParameters().get_energy_filters(), 
-                 num_histories: int=DefaultPincellParameters().num_histories(), 
+                 energy_filters: list=DefaultPincellParameters().energy_filters, 
+                 num_histories: int=DefaultPincellParameters().num_histories(), zernlike_order: int=DefaultPincellParameters().zernlike_order,
                  pincell_path: Path=None, default_pincell_parameters: DefaultPincellParameters=None,
                  burn_in: int=1000):
         """Generate the dataset of incident flux/outgoing flux cases for a given pincell calculation.
@@ -160,6 +165,10 @@ class DatasetGenerator:
             The number of histories used in the pincell calculation (this is used to determine the number of sample particles to generate
             for each randomly sampled incident flux profile). Note num_histories is not required if default_pincell_parameters is specified, as
             the number of histories is already defined in the DefaultPincellParameters class.
+        zernlike_order
+            The order of the Zernike expansion to use in the pincell calculation (this is used to determine the number of sample particles to generate
+            for each randomly sampled incident flux profile). Note zernlike_order is not required if default_pincell_parameters is specified, as
+            the order of the Zernike expansion is already defined in the DefaultPincellParameters class.
         pincell_path
             The path to the pincell calculation file (this can be your own, so long as you verify that the correct tallies are implemented
             and in the correct manner). If None, a default pincell script is used (which may nonetheless be useful for most LWR applications),
@@ -189,6 +198,7 @@ class DatasetGenerator:
         self.N_w = N_w
         self.output_dir = output_dir
         self.burn_in = burn_in
+        self.zernlike_order = zernlike_order
 
         # --------------------------------
         # Pincell parameter processing
@@ -354,6 +364,73 @@ class DatasetGenerator:
             "PYTHONPATH": os.environ["PYTHONPATH"],
         }
 
+        # Number of coefficients for the surface-based flux expansions:
+        G = len(self.energy_filters[0].values) - 1
+        flux_dim = (4, self.I, self.J, G, 1)
+        zernike_dim = (self.zernlike_order + 1) * (self.zernlike_order + 2) // 2
+
+        if rank == 0:
+            # Directory store for zarr
+            store = zarr.storage.LocalStore(self.output_dir / "dataset.zarr")
+            root = zarr.group(store=store, overwrite=True)
+
+            # Create the zarr arrays
+            store = zarr.storage.LocalStore(self.output_dir / "dataset.zarr")
+            root = zarr.group(store=store, overwrite=True)
+            flux_chunks = (10, 4, self.I, self.J, G, 1)
+
+            root.create_array(
+                "X_flux_coeffs", 
+                shape=(self.num_datapoints, *flux_dim),
+                chunks=flux_chunks,
+                dtype='float64'
+            )
+
+            root.create_array(
+                "X_weights",
+                shape=(self.num_datapoints, 4),
+                # The 'weights' array only has shape (N, 4) – so chunks must be length 2
+                chunks=(1, 4),
+                dtype='float64'
+            )
+
+            root.create_array(
+                "Y_flux_coeffs", 
+                shape=(self.num_datapoints, *flux_dim),
+                chunks=flux_chunks,
+                dtype='float64'
+            )
+
+            root.create_array(
+                "Y_power_coeffs", 
+                shape=(self.num_datapoints, zernike_dim),
+                # shape (N, zernike_dim) – so chunks must be length 2
+                chunks=(1, zernike_dim),
+                dtype='float64'
+            )
+
+
+        # Synchronize all ranks before writing
+        comm.Barrier()
+
+        # Open the zarr store in read/write mode on all ranks
+        store = zarr.storage.LocalStore(self.output_dir / "dataset.zarr")
+        root = zarr.open_group(store=store, mode='r+')
+
+        X_flux = root["X_flux_coeffs"]
+        X_wts  = root["X_weights"]
+        Y_flux = root["Y_flux_coeffs"]
+        Y_pow  = root["Y_power_coeffs"]
+
+        # Prepare environment for running each pincell case
+        env_no_mpi = {
+            'PATH': os.environ['PATH'],
+            'LD_LIBRARY_PATH': os.environ.get('LD_LIBRARY_PATH', ''),
+            'HOME': os.environ['HOME'],
+            'OPENMC_CROSS_SECTIONS': os.environ.get('OPENMC_CROSS_SECTIONS', ''),
+            "PYTHONPATH": os.environ["PYTHONPATH"],
+        }
+
         for index in range(rank, len(self.assignments), size):
             # Run the pincell calculation for each source file
             proc = subprocess.Popen(['python', str(self.pincell_path), self.output_dir / f'source{index}.h5'], env=env_no_mpi)
@@ -367,9 +444,30 @@ class DatasetGenerator:
             mesh_tally = pp.SurfaceMeshTally(str(self.output_dir / f'statepoint.source{index}.h5'))
             coefficients = pp.compute_coefficients(mesh_tally, self.I, self.J)
 
-            # Write the coefficients to a file
-            with h5py.File(self.output_dir / f'coefficients{index}.h5', 'w') as f:
-                f.create_dataset('coefficients', data=coefficients)
+            # Now extract and process the coefficients of the zernlike expansion
+            with openmc.StatePoint(self.output_dir / f'statepoint.source{index}.h5') as sp:
+                df = sp.get_tally(name='zernike').get_pandas_dataframe()
+
+            means = df['mean']
+            std_devs = df['std. dev.']
+
+            # Filter coefficients that are smaller than their respective standard deviations
+            filtered_coeffs = [mean if abs(mean) >= std_dev else 0 for mean, std_dev in zip(means, std_devs)]
+
+            # Now, gather the input data for this assignment
+            weights = np.array(self.assignments[index][0])
+            surface_indices = self.assignments[index][1]
+            surface_expansions = [ self.expansions[index//4].coefficients[index%4] if index is not None else np.zeros(flux_dim[1:]) for index in surface_indices ]
+            surface_expansions = np.array(surface_expansions)
+
+            # Now, write the data to the zarr store
+            X_flux[index] = coefficients
+            X_wts[index] = weights
+            Y_flux[index] = surface_expansions
+            Y_pow[index] = filtered_coeffs
+
+        # Sync processes before returning
+        comm.barrier()
 
 
 def round_preserving_sum(arr: np.ndarray) -> np.ndarray:
