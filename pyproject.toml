@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "pincell_moment_utils"
-version = "0.0.2"
+version = "0.0.3"
 description = "A tool for postprocessing and calculating flux moments for a pincell model"
 authors = [
     "Matthew Louis <matthewlouis31@gmail.com>"
@@ -18,10 +18,8 @@ pyprojroot = "*"
 openmc = "*"
 numpy = "*"
 typing = "*"
-subprocess = "*"
 py7zr = "*"
 mpi4py = "*"
-shutil = "*"
 emcee = "*"
 tqdm = "*"
 zarr = "*"
