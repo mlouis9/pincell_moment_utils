@@ -176,6 +176,7 @@ try:
     flux_tally_zernike = openmc.Tally(name = "zernike")
     flux_tally_zernike.id = 5
     flux_tally_zernike.scores = ['flux']
+    flux_tally_zernike.estimator = 'collision'
     zernike_filter = openmc.ZernikeFilter(order=order, x=0.0, y=0.0, r=radius)
     flux_tally_zernike.filters = [fuel_filter, zernike_filter]
     tallies.append(flux_tally_zernike)
@@ -236,6 +237,7 @@ try:
         tally.id = surface+1
         tally.filters = [surface_filters[surface], mesh_filters[surface], angle_filters[surface], energy_filter]
         tally.scores = ['flux']
+        tally.estimator = 'tracklength'
         tallies.append(tally)
 
     # keff tally
@@ -246,6 +248,7 @@ try:
     fuel_filter = openmc.CellFilter(fuel.id)
     fission_tally.filters = [fuel_filter]
     fission_tally.scores = ['fission']
+    fission_tally.estimator = 'collision'
     tallies.append(fission_tally)
 
     # Export tallies to XML
