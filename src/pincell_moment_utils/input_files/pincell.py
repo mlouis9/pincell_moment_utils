@@ -11,11 +11,20 @@ import shutil
 # Parsing command line argument for source file
 parser = argparse.ArgumentParser()
 parser.add_argument("source_file", type=str, help="Absolute path to OpenMC source file for incident flux.")
+parser.add_argument("--outdir", type=str, default=None, help="Output directory for statepoint and intermediate files.")
 args = parser.parse_args()
 source_file = Path(args.source_file).resolve()
 
+if args.outdir is not None:
+    outdir = Path(args.outdir).resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+else:
+    # If no output directory is given, fall back to a temporary directory (but then the file will be deleted)
+    outdir = Path(tempfile.mkdtemp())
+
+
 # Create a temporary directory where we will place all intermediate files
-tempdir = tempfile.mkdtemp()
+tempdir = Path(tempfile.mkdtemp())
 try:
     #===========
     # Materials
@@ -250,7 +259,7 @@ try:
     os.chdir(tempdir)
     openmc.lib.init()  # Initialize OpenMC in memory
     openmc.lib.run()   # Run the simulation
-    os.chdir(Path(__file__).parent)
+    os.chdir(outdir)
 
     # Manually write statepoint with custom filename
     custom_statepoint_name = f"statepoint.{source_name}.h5"
@@ -261,7 +270,14 @@ try:
 
 finally:
     # Ensure the temporary directory is cleaned up
+    import time
+
     try:
         shutil.rmtree(tempdir)
-    except Exception as e:
-        print(f"Error cleaning up temporary directory {tempdir}: {e}")
+    except OSError as e:
+        print(f"First attempt failed: {e}")
+        time.sleep(1)  # Wait a moment
+        try:
+            shutil.rmtree(tempdir)
+        except Exception as e:
+            print(f"Second attempt failed: {e}")

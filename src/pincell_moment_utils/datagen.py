@@ -355,7 +355,6 @@ class DatasetGenerator:
         file and rank 0 later merges these into a final .zarr store.
         """
 
-        import numpy as np
         comm = self.MPI.COMM_WORLD
         rank = comm.Get_rank()
         size = comm.Get_size()
@@ -385,24 +384,9 @@ class DatasetGenerator:
         # Each rank computes for its assigned indices
         for index in range(rank, len(self.assignments), size):
             # Run the pincell calculation for each source file
-            proc = subprocess.Popen(['python', str(self.pincell_path), self.output_dir / f'source{index}.h5'],
+            proc = subprocess.Popen(['python', str(self.pincell_path), self.output_dir / f'source{index}.h5', '--outdir', str(self.output_dir)],
                                     env=env_no_mpi)
             proc.communicate()
-
-            # Remove any existing file in the output directory
-            statepoint_dst = self.output_dir / f'statepoint.source{index}.h5'
-            if statepoint_dst.exists():
-                os.remove(statepoint_dst)
-
-            src = self.pincell_path.parent / f'statepoint.source{index}.h5'
-            dst = self.output_dir
-
-            try:
-                shutil.move(src, dst)
-            except OSError as e:
-                # If moving fails (e.g. cross-device link error), fall back to copy and remove
-                shutil.copy2(src, dst)
-                os.remove(src)
 
             # Process the output and calculate the outgoing flux expansion coefficients
             mesh_tally = pp.SurfaceMeshTally(str(self.output_dir / f'statepoint.source{index}.h5'))
