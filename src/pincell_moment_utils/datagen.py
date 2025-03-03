@@ -388,11 +388,20 @@ class DatasetGenerator:
                                     env=env_no_mpi)
             proc.communicate()
 
-            # Remove the source statepoint file if it exists and move the statepoint into the output directory
-            statepoint_file = self.output_dir / f'statepoint.source{index}.h5'
-            if statepoint_file.exists():
-                os.remove(statepoint_file)
-            shutil.move(self.pincell_path.parent / f'statepoint.source{index}.h5', self.output_dir)
+            # Remove any existing file in the output directory
+            statepoint_dst = self.output_dir / f'statepoint.source{index}.h5'
+            if statepoint_dst.exists():
+                os.remove(statepoint_dst)
+
+            src = self.pincell_path.parent / f'statepoint.source{index}.h5'
+            dst = self.output_dir
+
+            try:
+                shutil.move(src, dst)
+            except OSError as e:
+                # If moving fails (e.g. cross-device link error), fall back to copy and remove
+                shutil.copy2(src, dst)
+                os.remove(src)
 
             # Process the output and calculate the outgoing flux expansion coefficients
             mesh_tally = pp.SurfaceMeshTally(str(self.output_dir / f'statepoint.source{index}.h5'))
