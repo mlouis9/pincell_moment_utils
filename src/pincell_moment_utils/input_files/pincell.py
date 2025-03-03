@@ -6,6 +6,7 @@ from pathlib import Path
 import openmc.lib
 import tempfile
 import os
+import shutil
 
 # Parsing command line argument for source file
 parser = argparse.ArgumentParser()
@@ -14,7 +15,8 @@ args = parser.parse_args()
 source_file = Path(args.source_file).resolve()
 
 # Create a temporary directory where we will place all intermediate files
-with tempfile.TemporaryDirectory() as tempdir:
+tempdir = tempfile.mkdtemp()
+try:
     #===========
     # Materials
     #===========
@@ -256,3 +258,10 @@ with tempfile.TemporaryDirectory() as tempdir:
 
     # Finalize OpenMC
     openmc.lib.finalize()
+
+finally:
+    # Ensure the temporary directory is cleaned up
+    try:
+        shutil.rmtree(tempdir)
+    except Exception as e:
+        print(f"Error cleaning up temporary directory {tempdir}: {e}")

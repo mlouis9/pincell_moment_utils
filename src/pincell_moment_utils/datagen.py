@@ -379,6 +379,7 @@ class DatasetGenerator:
             'HOME': os.environ['HOME'],
             'OPENMC_CROSS_SECTIONS': os.environ.get('OPENMC_CROSS_SECTIONS', ''),
             "PYTHONPATH": os.environ["PYTHONPATH"],
+            "TMPDIR": str(self.output_dir),  # Force temporary files to be created in output_dir
         }
 
         # Each rank computes for its assigned indices
