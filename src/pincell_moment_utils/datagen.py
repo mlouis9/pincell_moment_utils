@@ -263,6 +263,7 @@ class DatasetGenerator:
         all_samples_local = np.zeros((self.N_p, self.num_histories, 3), dtype=np.float64)
 
         for i in range(rank, nexp, size):
+            print(f"Rank {rank} generating samples for expansion {i}")
             expansion = self.expansions[i]
             big_chunk = expansion.generate_samples(self.num_histories*4, burn_in=self.burn_in, progress=True, num_cores=cores_per_proc)
             big_chunk = np.array(big_chunk)
@@ -348,80 +349,28 @@ class DatasetGenerator:
         comm.Barrier()
 
     def generate_data(self):
-        """Generate the data for each case in `self.assignments` using the source files generated via the `generate_source_files` method.
-        The data is written to the output directory specified in the DatasetGenerator class. If the source files are not generated first,
-        this method will fail.
+        """Generate the data for each case in `self.assignments` using the source files generated
+        via the `generate_source_files` method. The data is written to the output directory specified 
+        in the DatasetGenerator class. This implementation has each MPI rank write its own temporary 
+        file and rank 0 later merges these into a final .zarr store.
         """
 
+        import numpy as np
         comm = self.MPI.COMM_WORLD
         rank = comm.Get_rank()
         size = comm.Get_size()
 
-        env_no_mpi = {
-            'PATH': os.environ['PATH'],
-            'LD_LIBRARY_PATH': os.environ.get('LD_LIBRARY_PATH', ''),
-            'HOME': os.environ['HOME'],
-            'OPENMC_CROSS_SECTIONS': os.environ.get('OPENMC_CROSS_SECTIONS', ''),
-            "PYTHONPATH": os.environ["PYTHONPATH"],
-        }
-
-        # Number of coefficients for the surface-based flux expansions:
+        # Get dimensions for the final arrays
         G = len(self.energy_filters[0].values) - 1
         flux_dim = (4, self.I, self.J, G, 1)
         zernike_dim = (self.zernlike_order + 1) * (self.zernlike_order + 2) // 2
 
-        if rank == 0:
-            # Directory store for zarr
-            store = zarr.storage.LocalStore(self.output_dir / "dataset.zarr")
-            root = zarr.group(store=store, overwrite=True)
-
-            # Create the zarr arrays
-            store = zarr.storage.LocalStore(self.output_dir / "dataset.zarr")
-            root = zarr.group(store=store, overwrite=True)
-            flux_chunks = (10, 4, self.I, self.J, G, 1)
-
-            root.create_array(
-                "X_flux_coeffs", 
-                shape=(self.num_datapoints, *flux_dim),
-                chunks=flux_chunks,
-                dtype='float64'
-            )
-
-            root.create_array(
-                "X_weights",
-                shape=(self.num_datapoints, 4),
-                # The 'weights' array only has shape (N, 4) – so chunks must be length 2
-                chunks=(1, 4),
-                dtype='float64'
-            )
-
-            root.create_array(
-                "Y_flux_coeffs", 
-                shape=(self.num_datapoints, *flux_dim),
-                chunks=flux_chunks,
-                dtype='float64'
-            )
-
-            root.create_array(
-                "Y_power_coeffs", 
-                shape=(self.num_datapoints, zernike_dim),
-                # shape (N, zernike_dim) – so chunks must be length 2
-                chunks=(1, zernike_dim),
-                dtype='float64'
-            )
-
-
-        # Synchronize all ranks before writing
-        comm.Barrier()
-
-        # Open the zarr store in read/write mode on all ranks
-        store = zarr.storage.LocalStore(self.output_dir / "dataset.zarr")
-        root = zarr.open_group(store=store, mode='r+')
-
-        X_flux = root["X_flux_coeffs"]
-        X_wts  = root["X_weights"]
-        Y_flux = root["Y_flux_coeffs"]
-        Y_pow  = root["Y_power_coeffs"]
+        # Prepare dictionaries to store local results
+        local_indices = []
+        local_X_flux = []
+        local_X_wts = []
+        local_Y_flux = []
+        local_Y_pow = []
 
         # Prepare environment for running each pincell case
         env_no_mpi = {
@@ -432,43 +381,113 @@ class DatasetGenerator:
             "PYTHONPATH": os.environ["PYTHONPATH"],
         }
 
+        # Each rank computes for its assigned indices
         for index in range(rank, len(self.assignments), size):
             # Run the pincell calculation for each source file
-            proc = subprocess.Popen(['python', str(self.pincell_path), self.output_dir / f'source{index}.h5'], env=env_no_mpi)
+            proc = subprocess.Popen(['python', str(self.pincell_path), self.output_dir / f'source{index}.h5'],
+                                    env=env_no_mpi)
             proc.communicate()
 
-            if Path(self.output_dir / f'statepoint.source{index}.h5').exists():
-                os.remove(self.output_dir / f'statepoint.source{index}.h5')
+            # Remove the source statepoint file if it exists and move the statepoint into the output directory
+            statepoint_file = self.output_dir / f'statepoint.source{index}.h5'
+            if statepoint_file.exists():
+                os.remove(statepoint_file)
             shutil.move(self.pincell_path.parent / f'statepoint.source{index}.h5', self.output_dir)
 
-            # Now process the output and calculate the outgoing flux expansion coefficients
+            # Process the output and calculate the outgoing flux expansion coefficients
             mesh_tally = pp.SurfaceMeshTally(str(self.output_dir / f'statepoint.source{index}.h5'))
             coefficients = pp.compute_coefficients(mesh_tally, self.I, self.J)
 
-            # Now extract and process the coefficients of the zernlike expansion
+            # Process the zernike expansion coefficients
             with openmc.StatePoint(self.output_dir / f'statepoint.source{index}.h5') as sp:
                 df = sp.get_tally(name='zernike').get_pandas_dataframe()
 
             means = df['mean']
             std_devs = df['std. dev.']
+            filtered_coeffs = [mean if abs(mean) >= std_dev else 0 
+                            for mean, std_dev in zip(means, std_devs)]
 
-            # Filter coefficients that are smaller than their respective standard deviations
-            filtered_coeffs = [mean if abs(mean) >= std_dev else 0 for mean, std_dev in zip(means, std_devs)]
-
-            # Now, gather the input data for this assignment
+            # Gather input data for this assignment
             weights = np.array(self.assignments[index][0])
             surface_indices = self.assignments[index][1]
-            surface_expansions = [ self.expansions[index//4].coefficients[index%4] if index is not None else np.zeros(flux_dim[1:]) for index in surface_indices ]
+            surface_expansions = [self.expansions[index // 4].coefficients[index % 4] 
+                                if index is not None else np.zeros(flux_dim[1:]) 
+                                for index in surface_indices]
             surface_expansions = np.array(surface_expansions)
 
-            # Now, write the data to the zarr store
-            X_flux[index] = coefficients
-            X_wts[index] = weights
-            Y_flux[index] = surface_expansions
-            Y_pow[index] = filtered_coeffs
+            # Append results locally
+            local_indices.append(index)
+            local_X_flux.append(coefficients)
+            local_X_wts.append(weights)
+            local_Y_flux.append(surface_expansions)
+            local_Y_pow.append(filtered_coeffs)
 
-        # Sync processes before returning
-        comm.barrier()
+        # Each rank saves its local results to a temporary .npz file
+        temp_filename = self.output_dir / f"temp_data_rank_{rank}.npz"
+        np.savez(temp_filename,
+                indices=np.array(local_indices),
+                X_flux=np.array(local_X_flux),
+                X_wts=np.array(local_X_wts),
+                Y_flux=np.array(local_Y_flux),
+                Y_pow=np.array(local_Y_pow))
+
+        # Wait for all ranks to finish writing temporary files
+        comm.Barrier()
+
+        # Only rank 0 creates the final Zarr store and merges the data
+        if rank == 0:
+            store_path = self.output_dir / "dataset.zarr"
+            store = zarr.storage.LocalStore(store_path)
+            root = zarr.group(store=store, overwrite=True)
+            flux_chunks = (10, 4, self.I, self.J, G, 1)
+
+            X_flux_array = root.create_array(
+                "X_flux_coeffs", 
+                shape=(self.num_datapoints, *flux_dim),
+                chunks=flux_chunks,
+                dtype='float64'
+            )
+            X_wts_array = root.create_array(
+                "X_weights",
+                shape=(self.num_datapoints, 4),
+                chunks=(1, 4),
+                dtype='float64'
+            )
+            Y_flux_array = root.create_array(
+                "Y_flux_coeffs", 
+                shape=(self.num_datapoints, *flux_dim),
+                chunks=flux_chunks,
+                dtype='float64'
+            )
+            Y_pow_array = root.create_array(
+                "Y_power_coeffs", 
+                shape=(self.num_datapoints, zernike_dim),
+                chunks=(1, zernike_dim),
+                dtype='float64'
+            )
+
+            # Loop over temporary files from all ranks and merge the results into the final arrays
+            for r in range(size):
+                temp_file = self.output_dir / f"temp_data_rank_{r}.npz"
+                if temp_file.exists():
+                    data = np.load(temp_file)
+                    indices = data["indices"]
+                    X_flux_data = data["X_flux"]
+                    X_wts_data = data["X_wts"]
+                    Y_flux_data = data["Y_flux"]
+                    Y_pow_data = data["Y_pow"]
+                    for local_idx, global_index in enumerate(indices):
+                        X_flux_array[global_index] = X_flux_data[local_idx]
+                        X_wts_array[global_index] = X_wts_data[local_idx]
+                        Y_flux_array[global_index] = Y_flux_data[local_idx]
+                        Y_pow_array[global_index] = Y_pow_data[local_idx]
+                    # Remove temporary file after merging
+                    os.remove(temp_file)
+                else:
+                    print(f"Warning: Temporary file for rank {r} not found.")
+                    
+        # Final barrier so that all processes wait until merging is complete
+        comm.Barrier()
 
 
 def round_preserving_sum(arr: np.ndarray) -> np.ndarray:

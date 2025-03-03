@@ -14,12 +14,14 @@ def main():
 
     num_cores_per_proc = len(os.sched_getaffinity(0))  # Get only the cores allocated to the MPI process
     print(f"Cores per proc: {num_cores_per_proc}")
-    num_datapoints = 10
-    I = 5
+    
+    num_datapoints = 100
+    I = 7
     J = 5
-    N_p = 5
-    N_w = 5
-    generator = DatasetGenerator(num_datapoints, I, J, N_p, N_w, output_dir=Path('./example_data'), num_histories=int(1E+04), burn_in=100)
+    N_p = 20
+    N_w = 9
+
+    generator = DatasetGenerator(num_datapoints, I, J, N_p, N_w, output_dir=Path('./data'), num_histories=int(1E+06), burn_in=1000)
 
     if args.mode == 'source_file':
         generator.generate_source_files()
@@ -27,6 +29,6 @@ def main():
         generator.generate_data()
     else:
         raise ValueError("Invalid argument. Must be either 'source_file' or 'data'.")
-    
+
 if __name__ == '__main__':
     main()
