@@ -1,6 +1,5 @@
 from pincell_moment_utils.datagen import DatasetGenerator, DefaultPincellParameters
 from pathlib import Path
-import os
 import argparse
 
 def main():
@@ -11,9 +10,7 @@ def main():
     # This is run by calling `mpiexec --np N_MPI --map-by socket:PE=N_CORES_PER_SOCKET_PER_MPI --bind-to core python mpi_test.py` where
     # N_MPI is the number of MPI processes and N_CORES_PER_SOCKET_PER_MPI is the number of cores per MPI process per socket. If working
     # with a single socket system, then this is just N_CORES_PER_MPI.
-
-    num_cores_per_proc = len(os.sched_getaffinity(0))  # Get only the cores allocated to the MPI process
-    print(f"Cores per proc: {num_cores_per_proc}")
+    
     num_datapoints = 20
     I = 5
     J = 5
@@ -21,8 +18,8 @@ def main():
     N_w = 9
     pincell_params = DefaultPincellParameters()
     pincell_params.wt_enrichment = 0.2
-    pincell_params.num_particles_per_generation = int(1E+02)
-    generator = DatasetGenerator(num_datapoints, I, J, N_p, N_w, output_dir=Path('./example_data'), burn_in=100,
+    pincell_params.num_particles_per_generation = int(1E+04)
+    generator = DatasetGenerator(num_datapoints, I, J, N_p, N_w, output_dir=Path('./example_data'), burn_in=1000,
                                  default_pincell_parameters=pincell_params)
 
     if args.mode == 'source_file':
