@@ -230,7 +230,8 @@ try:
 
     # Outgoing flux tallies on surfaces
     # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    tally_names = [f'flux_at_{side}_boundary' for side in ['right', 'left', 'top', 'bottom']]
+    surface_names = ['right', 'left', 'top', 'bottom']
+    tally_names = [f'flux_at_{side}_boundary' for side in surface_names ]
 
     for surface in range(4):
         tally = openmc.Tally(name = tally_names[surface])
@@ -242,14 +243,28 @@ try:
 
     # keff tally
     # ^^^^^^^^^^
-    # Tally for counting fissions in the fuel
-    fission_tally = openmc.Tally(name='keff')
-    fission_tally.id = 6
-    fuel_filter = openmc.CellFilter(fuel.id)
-    fission_tally.filters = [fuel_filter]
-    fission_tally.scores = ['fission']
-    fission_tally.estimator = 'collision'
-    tallies.append(fission_tally)
+    # Note for this pincell, we calculate the outgoing surface currents and sum the absolute values (because all currents are outgoing due
+    # to the way the filters are setup below) to get the nonleakage fraction (this corresponds to the reported "leakage fraction" in the
+    # OpenMC output if nonzero_surfaces is all surfaces, note this is because only zero surfaces correspond to true system boundaries, and
+    # hence if there are none, all outgoing fluxes correspond to nonleakage)
+
+    # Read surfaces with nonzero coefficients (these correspond to non-boundary surfaces)
+    with h5py.File(source_file) as f:
+        nonzero_surfaces = f.attrs['nonzero_surfaces']
+
+    tally_surface_ids = [right.id, left.id, top.id, bottom.id]
+    tally_id = 6
+    for i, surface in enumerate(range(4)):
+        if surface in nonzero_surfaces:
+            nonleakage_tally = openmc.Tally(name=f'nonleakage{i}')
+        else:
+            nonleakage_tally = openmc.Tally(name=f'leakage{i}')
+        nonleakage_tally.id = tally_id
+        nonleakage_tally.filters = [ openmc.SurfaceFilter(tally_surface_ids[surface]), openmc.CellFilter(tally_cell_ids[surface]) ]
+        nonleakage_tally.scores = ['current']
+        nonleakage_tally.estimator = 'analog'
+        tallies.append(nonleakage_tally)
+        tally_id += 1
 
     # Export tallies to XML
     tallies.export_to_xml(Path(tempdir) / 'tallies.xml')

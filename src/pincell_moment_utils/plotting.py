@@ -43,10 +43,13 @@ def plot_expansion(expansion: SurfaceExpansionBase, space_index: int, angle_inde
     E_max = expansion.energy_filters[surface].bins[-1][-1]
     expansion_vals = expansion.evaluate_on_grid(surface, (space_vals, angle_vals, energy_vals))
     vmax = np.max(expansion_vals)
-    if vmax > 0:
+    vmin = np.min(expansion_vals)
+    if vmax > 0 and vmin > 0:
         norm = LogNorm(vmax=vmax)
+    elif vmax == 0:
+        norm = Normalize(vmin=vmin, vmax=1E-10)  # Linear scale with small max
     else:
-        norm = Normalize(vmin=0, vmax=1E-10)  # Linear scale with small max
+        norm = Normalize(vmin=0, vmax=vmax)
 
     # Plot a 2D slice with energy fixed
     flux_energy_slice = expansion_vals[:, :, energy_index]  # Fix energy

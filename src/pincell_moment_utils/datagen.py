@@ -346,6 +346,10 @@ class DatasetGenerator:
             # Now write the samples to a source file
             openmc.write_source_file(source_particles, self.output_dir / f"source{index}.h5")
 
+            # ====== Add Metadata to the Source File ======
+            with h5py.File(self.output_dir / f"source{index}.h5", 'a') as f:
+                f.attrs["nonzero_surfaces"] = np.array(nonzero_surfaces, dtype=np.int32)
+
         comm.Barrier()
 
     def generate_data(self):
@@ -370,6 +374,8 @@ class DatasetGenerator:
         local_X_wts = []
         local_Y_flux = []
         local_Y_pow = []
+        local_Y_keff = []
+        local_Y_wts = []
 
         # Prepare environment for running each pincell case
         env_no_mpi = {
@@ -391,10 +397,20 @@ class DatasetGenerator:
             # Process the output and calculate the outgoing flux expansion coefficients
             mesh_tally = pp.SurfaceMeshTally(str(self.output_dir / f'statepoint.source{index}.h5'))
             coefficients = pp.compute_coefficients(mesh_tally, self.I, self.J)
+            # Normalize the output coefficients, since relative weights and scale are preserved in Y_wts and Y_keff
+            coefficients = normalize_outgoing_coefs(coefficients, self.energy_filters, self.I, self.J)
 
             # Process the zernike expansion coefficients
             with openmc.StatePoint(self.output_dir / f'statepoint.source{index}.h5') as sp:
                 df = sp.get_tally(name='zernike').get_pandas_dataframe()
+                # Extract nonleakage tallies
+                tally_names = [ (id, sp.tallies[id].name) for id in sp.tallies.keys() ]
+                nonleakage_tally_ids = [id for id, name in tally_names if 'nonleakage' in name]
+                nonleakage_tallies = np.array([ sp.get_tally(id=id).mean for id in nonleakage_tally_ids ])
+                keff = np.sum(np.abs(nonleakage_tallies))
+                y_wts = np.array([ sp.get_tally(id=id).mean[0][0][0] for id in range(6, 10) ])
+                y_wts = np.abs(y_wts)
+                y_wts /= np.sum(y_wts)
 
             means = df['mean']
             std_devs = df['std. dev.']
@@ -411,10 +427,12 @@ class DatasetGenerator:
 
             # Append results locally
             local_indices.append(index)
-            local_X_flux.append(coefficients)
+            local_X_flux.append(surface_expansions)
             local_X_wts.append(weights)
-            local_Y_flux.append(surface_expansions)
+            local_Y_flux.append(coefficients)
             local_Y_pow.append(filtered_coeffs)
+            local_Y_keff.append(keff)
+            local_Y_wts.append(y_wts)
 
         # Each rank saves its local results to a temporary .npz file
         temp_filename = self.output_dir / f"temp_data_rank_{rank}.npz"
@@ -423,7 +441,9 @@ class DatasetGenerator:
                 X_flux=np.array(local_X_flux),
                 X_wts=np.array(local_X_wts),
                 Y_flux=np.array(local_Y_flux),
-                Y_pow=np.array(local_Y_pow))
+                Y_pow=np.array(local_Y_pow),
+                Y_keff=np.array(local_Y_keff),
+                Y_wts=np.array(local_Y_wts))
 
         # Wait for all ranks to finish writing temporary files
         comm.Barrier()
@@ -459,6 +479,18 @@ class DatasetGenerator:
                 chunks=(1, zernike_dim),
                 dtype='float64'
             )
+            Y_keff_array = root.create_array(
+                "Y_keff", 
+                shape=(self.num_datapoints,),
+                chunks=(1,),
+                dtype='float64'
+            )
+            Y_wts_array = root.create_array(
+                "Y_weights", 
+                shape=(self.num_datapoints, 4),
+                chunks=(1, 4),
+                dtype='float64'
+            )
 
             # Loop over temporary files from all ranks and merge the results into the final arrays
             for r in range(size):
@@ -470,11 +502,15 @@ class DatasetGenerator:
                     X_wts_data = data["X_wts"]
                     Y_flux_data = data["Y_flux"]
                     Y_pow_data = data["Y_pow"]
+                    Y_keff_data = data["Y_keff"]
+                    Y_wts_data = data["Y_wts"]
                     for local_idx, global_index in enumerate(indices):
                         X_flux_array[global_index] = X_flux_data[local_idx]
                         X_wts_array[global_index] = X_wts_data[local_idx]
                         Y_flux_array[global_index] = Y_flux_data[local_idx]
                         Y_pow_array[global_index] = Y_pow_data[local_idx]
+                        Y_keff_array[global_index] = Y_keff_data[local_idx]
+                        Y_wts_array[global_index] = Y_wts_data[local_idx]
                     # Remove temporary file after merging
                     os.remove(temp_file)
                 else:
@@ -514,3 +550,33 @@ def round_preserving_sum(arr: np.ndarray) -> np.ndarray:
     result[indices[:deficit]] += 1  # Increase elements with largest remainders
 
     return result.astype(int)  # Ensure integer output
+
+
+def normalize_outgoing_coefs(coefficients, energy_filters, n_spatial_terms, n_angular_terms):
+    for surface in range(4):
+        smin, smax = config.SPATIAL_BOUNDS[surface]
+        omin, omax = config.OUTGOING_ANGULAR_BOUNDS[surface]
+
+        # 2) Pull the energy bin widths
+        efilter = energy_filters[surface]
+        dE = np.diff(efilter.bins, axis=1).flatten()  # shape (N_energy,)
+
+        # 3) The total scale factor for space+angle:
+        #    Because integral of B_{i,I-1} is 1/I on [0,1],
+        #    after scaling to [smin, smax], we get (smax-smin)/I.
+        #    Similarly (omax-omin)/J for the angle dimension.
+        space_factor = ((smax - smin)/n_spatial_terms) * \
+                    ((omax - omin)/n_angular_terms)
+
+        # 4) Our coefficients for this surface: shape (I, J, N_energy, 1)
+        c_ijE = coefficients[surface, :, :, :, 0]  # => shape (I, J, N_energy)
+
+        # 5) Sum over i,j => sum_c[k] = Σ_{i=0..I-1} Σ_{j=0..J-1} c_{i,j,k}
+        sum_c_k = c_ijE.sum(axis=(0,1))  # shape (N_energy,)
+
+        # 6) Multiply each sum_c_k by (space_factor * dE[k]) and sum over k
+        flux_integral = np.sum(sum_c_k * space_factor * dE)
+        # 7) Normalize the coefficients
+        coefficients[surface, :, :, :, 0] /= flux_integral
+    
+    return coefficients

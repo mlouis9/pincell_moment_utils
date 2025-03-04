@@ -1056,7 +1056,8 @@ def surface_expansion(
 
 
 def random_surface_expansion(num_space: int, num_angle: int, energy_filters: list, 
-                             expansion_type: str = 'bernstein_bernstein', incident: bool=True) -> SurfaceExpansionBase:
+                             expansion_type: str = 'bernstein_bernstein', incident: bool=True,
+                             energy_bias_method: str='random_multiscale_gaussian', bias_parameters=(5,2)) -> SurfaceExpansionBase:
     """Create a surface expansion with randomly sampled coefficients. This surface expansion will be properly normalized, and
     have coefficients that ensure a positive definite surface expansion. This is currently only implemented for the Bernstein Bernstein
     expansion.
@@ -1073,7 +1074,14 @@ def random_surface_expansion(num_space: int, num_angle: int, energy_filters: lis
         The type of expansion to use. Currently only 'bernstein_bernstein' is supported.
     incident
         If True, the expansion is for incident flux. If False, the expansion is for outgoing flux. The default is true because this function
-        is used for generating random incident flux expansions for data generation. 
+        is used for generating random incident flux expansions for data generation.
+    energy_bias_method
+        The method used to bias the flux distribution to lower/higher energies, this is intended to better recreate energy dependent fluxes
+        characteristic of the regimes important in the slowing down process. 'random_multiscale_gaussian' is recommended.
+    bias_parameters
+        The parameters for the biasing method. This is only used for the 'random_multiscale_gaussian' method, where it is a tuple of 
+        (α, β) used for biasing the peak of the energy distribution. Choose α, β to bias the distribution towards lower energies or
+        smaller energies. By default these are set to (5, 2) which biases the distribution slightly towards lower energies.
 
     Returns
     -------
@@ -1088,6 +1096,35 @@ def random_surface_expansion(num_space: int, num_angle: int, energy_filters: lis
         coefficients = np.zeros(shape)
         for surface in range(4):
             coefficients[surface] = sample_coefficients(shape[1:])
+            energy_values = np.diff(energy_filters[surface].values)
+            match energy_bias_method:
+                # All low energy biasing methods are intended only for testing
+                case 'exponential':
+                    weights = np.exp(-energy_values)
+                case 'floored_exponential':
+                    weights = np.exp(-energy_values)
+                    minimum_weight = np.min(weights[weights != 0])/10
+                    weights[weights == 0] = minimum_weight
+                case 'power_law':
+                    weights = energy_values**(-2)
+                case 'lowest_energy_only': # Very extreme weighting that is only intended for testing
+                    weights = np.zeros_like(energy_values)
+                    weights[0] = 1
+                case 'random_multiscale_gaussian':
+                    E_min = energy_filters[surface].bins[0, 0]
+                    E_max = energy_filters[surface].bins[-1, 1]
+
+                    # Sample a random energy peak according to Beta(3,2), this biases towards higher energies, more representative of
+                    # the slowing down process
+                    E_peak = np.log10(E_min) + np.random.beta(*bias_parameters)*(np.log10(E_max) - np.log10(E_min))
+                    # Sample a random width log-uniformly
+                    width = np.random.uniform(1, np.log10(E_max) - np.log10(E_min))
+
+                    # Create a Gaussian centered at E_peak with the sampled width
+                    weights = np.exp(-((np.log(energy_values) - E_peak) ** 2) / (2 * width ** 2))
+
+            coefficients[surface] *= weights[np.newaxis, np.newaxis, :, np.newaxis]
+            coefficients[surface] /= np.sum(coefficients[surface]) # Renormalize coefficients
         
         # Now rescale coefficients according to the functional expansion
         for surface in range(4):
