@@ -343,12 +343,21 @@ class DatasetGenerator:
                                           E=sample[2])
                     source_particles.append(p)
 
-            # Now write the samples to a source file
-            openmc.write_source_file(source_particles, self.output_dir / f"source{index}.h5")
+            # Define final file name and a temporary file name
+            final_path = self.output_dir / f"source{index}.h5"
+            temp_path = self.output_dir / f"temp_source{index}.h5"
 
-            # ====== Add Metadata to the Source File ======
-            with h5py.File(self.output_dir / f"source{index}.h5", 'a') as f:
+            # Write the source file to the temporary file instead of directly to the final file.
+            openmc.write_source_file(source_particles, temp_path)
+
+            # Add metadata safely to the temporary file.
+            with h5py.File(temp_path, 'a') as f:
                 f.attrs["nonzero_surfaces"] = np.array(nonzero_surfaces, dtype=np.int32)
+                # Optionally, force a flush:
+                f.flush()
+
+            # Atomically rename the temporary file to the final file.
+            os.rename(temp_path, final_path)
 
         comm.Barrier()
 
