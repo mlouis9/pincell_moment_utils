@@ -242,7 +242,7 @@ class DatasetGenerator:
         self.assignments = [ ( assignment[0], surface_assignment) for assignment in self.assignments for surface_assignment in assignment[1] ]
 
         
-    def _generate_samples(self) -> np.ndarray:
+    def generate_samples(self) -> None:
         """Generate samples for each of the randomly generated surface expansions. 
         
         Returns
@@ -265,35 +265,40 @@ class DatasetGenerator:
         for i in range(rank, nexp, size):
             print(f"Rank {rank} generating samples for expansion {i}")
             expansion = self.expansions[i]
-            big_chunk = expansion.generate_samples(self.num_histories*4, burn_in=self.burn_in, progress=True, num_cores=cores_per_proc)
+            # We'll generate 4*self.num_histories samples, because each expansion has 4 surfaces
+            big_chunk = expansion.generate_samples(self.num_histories * 4, burn_in=self.burn_in,
+                                                   progress=True, num_cores=cores_per_proc)
             big_chunk = np.array(big_chunk)
-
-            # Figure out how many surfaces we actually store
-            # If this is the last expansion and N_p not multiple of 4, might only store remainder
+            
             start_idx = i * 4
             end_idx = start_idx + 4
+
+            # If the last expansion is only partially used (N_p not multiple of 4), adjust
             if i == nexp - 1 and (self.N_p % 4) != 0:
                 remainder = self.N_p % 4
                 end_idx = start_idx + remainder
+                big_chunk = big_chunk[: remainder, :, :]
 
-                # Slice big_chunk to keep only remainder * self.num_histories rows
-                big_chunk = big_chunk[: remainder, :]
-
-            # Now place the samples into all_samples_local
-            # big_chunk has shape (4*self.num_histories, 3) if full, or remainder * self.num_histories
-            # We want to reshape it to (n_surfaces, num_histories, 3)
+            # Reshape into (n_surfaces_for_this_expansion, num_histories, 3)
             n_surfaces = end_idx - start_idx
             big_chunk_reshaped = big_chunk.reshape(n_surfaces, self.num_histories, 3)
             all_samples_local[start_idx:end_idx, :, :] = big_chunk_reshaped
 
-        # Now reduce so that each rank ends up with the complete array
+        # Allreduce to gather everyone's data
         all_samples = np.zeros_like(all_samples_local)
         comm.Allreduce(all_samples_local, all_samples, op=self.MPI.SUM)
 
-        # Sync processes before returning
         comm.Barrier()
 
-        return all_samples
+        # Rank 0 writes the samples to an HDF5 file
+        if rank == 0:
+            if not self.output_dir.exists():
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+            with h5py.File(self.output_dir / "samples.h5", 'w') as hf:
+                hf.create_dataset(
+                    "samples", data=all_samples, compression="gzip"
+                )
+        comm.Barrier()
 
     def generate_source_files(self) -> None:
         """Generate source files for each case in `self.assignments` using the samples (of the randomly generated surface profiles) generated
@@ -301,7 +306,7 @@ class DatasetGenerator:
         """
 
         # begin sampling
-        all_samples = self._generate_samples()
+        all_samples = self.generate_samples()
 
         comm = self.MPI.COMM_WORLD
         rank = comm.Get_rank()
@@ -387,68 +392,156 @@ class DatasetGenerator:
             "TMPDIR": str(self.output_dir),  # Force temporary files to be created in output_dir
         }
 
-        # Each rank computes for its assigned indices
-        for index in range(rank, len(self.assignments), size):
-            # Run the pincell calculation for each source file
-            proc = subprocess.Popen(['python', str(self.pincell_path), self.output_dir / f'source{index}.h5', '--outdir', str(self.output_dir)],
-                                    env=env_no_mpi)
-            proc.communicate()
+        # Ensure the samples file is present
+        samples_path = self.output_dir / "samples.h5"
+        if not samples_path.is_file():
+            raise FileNotFoundError(f"Samples file not found at {samples_path}. "
+                                    "Please run _generate_samples() first.")
 
-            # Process the output and calculate the outgoing flux expansion coefficients
-            mesh_tally = pp.SurfaceMeshTally(str(self.output_dir / f'statepoint.source{index}.h5'))
-            coefficients = pp.compute_coefficients(mesh_tally, self.I, self.J)
-            # Normalize the output coefficients, since relative weights and scale are preserved in Y_wts and Y_keff
-            coefficients = normalize_outgoing_coefs(coefficients, self.energy_filters, self.I, self.J)
+        # We'll open the samples file once for reading
+        with h5py.File(samples_path, 'r') as hf:
+            samples_dataset = hf['samples']
 
-            # Process the zernike expansion coefficients
-            with openmc.StatePoint(self.output_dir / f'statepoint.source{index}.h5') as sp:
-                df = sp.get_tally(name='zernike').get_pandas_dataframe()
-                # Extract nonleakage tallies
-                tally_names = [ (id, sp.tallies[id].name) for id in sp.tallies.keys() ]
-                nonleakage_tally_ids = [id for id, name in tally_names if 'nonleakage' in name]
-                nonleakage_tallies = np.array([ sp.get_tally(id=id).mean for id in nonleakage_tally_ids ])
-                keff = np.sum(np.abs(nonleakage_tallies))
-                y_wts = np.array([ sp.get_tally(id=id).mean[0][0][0] for id in range(6, 10) ])
-                y_wts = np.abs(y_wts)
-                y_wts /= np.sum(y_wts)
+            # Loop over assigned data points
+            for index in range(rank, len(self.assignments), size):
+                # Each assignment is (weights, surface_assignments)
+                assignment = self.assignments[index]
+                weights = np.array(assignment[0])
+                surface_assignments = assignment[1]
+                N_surface = round_preserving_sum(weights * self.num_histories)
+                nonzero_surfaces = [
+                    surface for surface in range(4)
+                    if surface_assignments[surface] is not None
+                ]
 
-            means = df['mean']
-            std_devs = df['std. dev.']
-            filtered_coeffs = [mean if abs(mean) >= std_dev else 0 
-                            for mean, std_dev in zip(means, std_devs)]
+                # Build the ephemeral source file
+                source_particles = []
+                for surface in nonzero_surfaces:
+                    expansion_idx = surface_assignments[surface]  # which row in the big samples array
+                    if expansion_idx is None:
+                        continue
+                    # Load the required samples from the dataset
+                    chunk = samples_dataset[expansion_idx, :N_surface[surface], :]
+                    
+                    # Transform angles for the appropriate surface
+                    angle_transform = config.INCIDENT_ANGLE_TRANSFORMATIONS[
+                        assignment[1][surface] % 4
+                    ][surface]
 
-            # Gather input data for this assignment
-            weights = np.array(self.assignments[index][0])
-            surface_indices = self.assignments[index][1]
-            surface_expansions = [self.expansions[index // 4].coefficients[index % 4] 
-                                if index is not None else np.zeros(flux_dim[1:]) 
-                                for index in surface_indices]
-            surface_expansions = np.array(surface_expansions)
+                    # Convert sample coordinate from config
+                    surface_coord_3d = config.SURFACE_COORD_TO_3D[surface]
 
-            # Append results locally
-            local_indices.append(index)
-            local_X_flux.append(surface_expansions)
-            local_X_wts.append(weights)
-            local_Y_flux.append(coefficients)
-            local_Y_pow.append(filtered_coeffs)
-            local_Y_keff.append(keff)
-            local_Y_wts.append(y_wts)
+                    for sample in chunk:
+                        xval, omega_in, E = sample
+                        omega_transformed = angle_transform(omega_in)
+                        p = openmc.SourceParticle(
+                            r=surface_coord_3d(xval),
+                            u=(np.cos(omega_transformed), np.sin(omega_transformed), 0.0),
+                            E=E
+                        )
+                        source_particles.append(p)
 
-        # Each rank saves its local results to a temporary .npz file
+                # Write to a temporary source file
+                source_file_path = self.output_dir / f"source{index}.h5"
+                openmc.write_source_file(source_particles, source_file_path)
+
+                # ====== Add Metadata to the Source File ======
+                with h5py.File(self.output_dir / f"source{index}.h5", 'a') as f:
+                    f.attrs["nonzero_surfaces"] = np.array(nonzero_surfaces, dtype=np.int32)
+
+                # Run the pincell calculation with this temp source file
+                proc = subprocess.Popen(
+                    [
+                        'python', str(self.pincell_path), 
+                        str(source_file_path), 
+                        '--outdir', str(self.output_dir)
+                    ],
+                    env=env_no_mpi
+                )
+                proc.communicate()
+
+                # The pincell script is expected to produce statepoint.source{index}.h5
+                sp_path = self.output_dir / f"statepoint.source{index}.h5"
+
+                # Now post-process
+                mesh_tally = pp.SurfaceMeshTally(str(sp_path))
+                coefficients = pp.compute_coefficients(mesh_tally, self.I, self.J)
+                coefficients = normalize_outgoing_coefs(
+                    coefficients, self.energy_filters, self.I, self.J
+                )
+
+                # Grab the Zernike / keff / power weighting from the statepoint
+                with openmc.StatePoint(sp_path) as sp:
+                    df = sp.get_tally(name='zernike').get_pandas_dataframe()
+
+                    # Example: gather some placeholders for demonstration
+                    # (your real logic to parse tallies might differ)
+                    tally_names = [(id, sp.tallies[id].name) for id in sp.tallies.keys()]
+                    nonleakage_tally_ids = [
+                        tid for tid, name in tally_names if 'nonleakage' in name
+                    ]
+                    nonleakage_tallies = np.array([
+                        sp.get_tally(id=tid).mean for tid in nonleakage_tally_ids
+                    ])
+                    keff = np.sum(np.abs(nonleakage_tallies))
+
+                    # Example: parse some weighting from tallies with IDs 6..9
+                    y_wts = []
+                    for tid in range(6, 10):
+                        if tid in sp.tallies:
+                            y_wts.append(sp.get_tally(id=tid).mean[0][0][0])
+                        else:
+                            y_wts.append(0.0)
+                    y_wts = np.abs(y_wts)
+                    if np.sum(y_wts) > 0:
+                        y_wts /= np.sum(y_wts)
+
+                means = df['mean']
+                std_devs = df['std. dev.']
+                filtered_coeffs = [
+                    mean if abs(mean) >= std_dev else 0
+                    for mean, std_dev in zip(means, std_devs)
+                ]
+
+                # Gather input data for this assignment
+                weights = np.array(self.assignments[index][0])
+                surface_indices = self.assignments[index][1]
+                surface_expansions = [self.expansions[index // 4].coefficients[index % 4] 
+                                    if index is not None else np.zeros(flux_dim[1:]) 
+                                    for index in surface_indices]
+                surface_expansions = np.array(surface_expansions)
+
+                # Append local results
+                local_indices.append(index)
+                local_X_flux.append(surface_expansions)   # or real expansions if you are storing them
+                local_X_wts.append(weights)
+                local_Y_flux.append(coefficients)
+                local_Y_pow.append(filtered_coeffs)
+                local_Y_keff.append(keff)
+                local_Y_wts.append(y_wts)
+
+                # Delete temporary source and statepoint files to minimize storage
+                if source_file_path.exists():
+                    source_file_path.unlink()
+                if sp_path.exists():
+                    sp_path.unlink()
+
+        # Save local results to a temporary .npz
         temp_filename = self.output_dir / f"temp_data_rank_{rank}.npz"
-        np.savez(temp_filename,
-                indices=np.array(local_indices),
-                X_flux=np.array(local_X_flux),
-                X_wts=np.array(local_X_wts),
-                Y_flux=np.array(local_Y_flux),
-                Y_pow=np.array(local_Y_pow),
-                Y_keff=np.array(local_Y_keff),
-                Y_wts=np.array(local_Y_wts))
+        np.savez(
+            temp_filename,
+            indices=np.array(local_indices),
+            X_flux=np.array(local_X_flux),
+            X_wts=np.array(local_X_wts),
+            Y_flux=np.array(local_Y_flux),
+            Y_pow=np.array(local_Y_pow),
+            Y_keff=np.array(local_Y_keff),
+            Y_wts=np.array(local_Y_wts)
+        )
 
-        # Wait for all ranks to finish writing temporary files
         comm.Barrier()
 
-        # Only rank 0 creates the final Zarr store and merges the data
+        # Rank 0 merges everything into a Zarr store
         if rank == 0:
             store_path = self.output_dir / "dataset.zarr"
             store = zarr.storage.LocalStore(store_path)
@@ -492,7 +585,7 @@ class DatasetGenerator:
                 dtype='float64'
             )
 
-            # Loop over temporary files from all ranks and merge the results into the final arrays
+            # Merge data from all ranks
             for r in range(size):
                 temp_file = self.output_dir / f"temp_data_rank_{r}.npz"
                 if temp_file.exists():
@@ -504,6 +597,7 @@ class DatasetGenerator:
                     Y_pow_data = data["Y_pow"]
                     Y_keff_data = data["Y_keff"]
                     Y_wts_data = data["Y_wts"]
+
                     for local_idx, global_index in enumerate(indices):
                         X_flux_array[global_index] = X_flux_data[local_idx]
                         X_wts_array[global_index] = X_wts_data[local_idx]
@@ -511,12 +605,11 @@ class DatasetGenerator:
                         Y_pow_array[global_index] = Y_pow_data[local_idx]
                         Y_keff_array[global_index] = Y_keff_data[local_idx]
                         Y_wts_array[global_index] = Y_wts_data[local_idx]
-                    # Remove temporary file after merging
+
                     os.remove(temp_file)
                 else:
                     print(f"Warning: Temporary file for rank {r} not found.")
-                    
-        # Final barrier so that all processes wait until merging is complete
+
         comm.Barrier()
 
 
