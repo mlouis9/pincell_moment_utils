@@ -260,7 +260,6 @@ class DatasetGenerator:
         cores_per_proc = int(os.environ.get("OMP_NUM_THREADS", cores_per_proc)) # Override if OMP_NUM_THREADS is set
 
         nexp = len(self.expansions)
-        all_samples_local = np.zeros((self.N_p, self.num_histories, 3), dtype=np.float64)
 
         for i in range(rank, nexp, size):
             print(f"Rank {rank} generating samples for expansion {i}")
@@ -280,82 +279,20 @@ class DatasetGenerator:
                 big_chunk = big_chunk[: remainder, :, :]
 
             # Reshape into (n_surfaces_for_this_expansion, num_histories, 3)
-            n_surfaces = end_idx - start_idx
-            big_chunk_reshaped = big_chunk.reshape(n_surfaces, self.num_histories, 3)
-            all_samples_local[start_idx:end_idx, :, :] = big_chunk_reshaped
+            num_surfaces = end_idx - start_idx
+            reshaped = big_chunk.reshape(num_surfaces, self.num_histories, 3)
 
-        # Allreduce to gather everyone's data
-        all_samples = np.zeros_like(all_samples_local)
-        comm.Allreduce(all_samples_local, all_samples, op=self.MPI.SUM)
-
-        comm.Barrier()
-
-        # Rank 0 writes the samples to an HDF5 file
-        if rank == 0:
+            # Write each surface to its own file
             if not self.output_dir.exists():
                 self.output_dir.mkdir(parents=True, exist_ok=True)
-            with h5py.File(self.output_dir / "samples.h5", 'w') as hf:
-                hf.create_dataset(
-                    "samples", data=all_samples, compression="gzip"
-                )
-        comm.Barrier()
 
-    def generate_source_files(self) -> None:
-        """Generate source files for each case in `self.assignments` using the samples (of the randomly generated surface profiles) generated
-        in the first part. These source files are written to the output directory specified in the DatasetGenerator class.
-        """
-
-        # begin sampling
-        all_samples = self.generate_samples()
-
-        comm = self.MPI.COMM_WORLD
-        rank = comm.Get_rank()
-        size = comm.Get_size()
-
-        # First, create the output directory if it does not exist
-        if not self.output_dir.exists():
-            # Let rank 0 create the directory; then barrier so everyone sees it
-            if rank == 0:
-                self.output_dir.mkdir(parents=True, exist_ok=True)
-            comm.Barrier()
-        
-        surface_coord_to_3d = config.SURFACE_COORD_TO_3D
-        incident_angle_transformations = config.INCIDENT_ANGLE_TRANSFORMATIONS
-
-        # Now, generate the source files for each case in self.assignments
-        for index in range(rank, len(self.assignments), size):
-            assignment = self.assignments[index]
-            source_particles = []
-
-            # First extract the surface weights and the surface assignments from the assignment
-            weights = np.array(assignment[0])
-            N_surface = round_preserving_sum(weights * self.num_histories)
-            surface_assignments = assignment[1]
-            nonzero_surfaces = [surface for surface in range(4) if surface_assignments[surface] is not None] # Surfaces that have non-zero weights
-            
-            # First append source particles to an OpenMC SourceParticle object for each surface in the assignment
-            for surface in nonzero_surfaces:
-                # First transform the angular variable to the appropriate angular domain for the surface that the profile is being
-                # assigned to. This is done by using the incident angle transformations defined in the config module.
-                original_surface = assignment[1][surface] % 4
-                angle_transform = incident_angle_transformations[original_surface][surface]
-
-                for sample in all_samples[assignment[1][surface], :N_surface[surface]]: # Only draw N_surface samples from each surface
-                    ω = angle_transform(sample[1]) # Transform the angular domain to that for the appropriate surface
-
-                    # Now, create the source particle for the surface
-                    p = openmc.SourceParticle(r=surface_coord_to_3d[surface](sample[0]), u = (np.cos(ω), np.sin(ω), 0), 
-                                          E=sample[2])
-                    source_particles.append(p)
-
-            # Now write the samples to a source file
-            openmc.write_source_file(source_particles, self.output_dir / f"source{index}.h5")
-
-            # ====== Add Metadata to the Source File ======
-            with h5py.File(self.output_dir / f"source{index}.h5", 'a') as f:
-                f.attrs["nonzero_surfaces"] = np.array(nonzero_surfaces, dtype=np.int32)
+            for j in range(num_surfaces):
+                surface_id = start_idx + j
+                with h5py.File(self.output_dir / f"profile_{surface_id}.h5", 'w') as hf:
+                    hf.create_dataset("samples", data=reshaped[j], compression="gzip")
 
         comm.Barrier()
+
 
     def generate_data(self):
         """Generate the data for each case in `self.assignments` using the source files generated
@@ -392,139 +329,140 @@ class DatasetGenerator:
             "TMPDIR": str(self.output_dir),  # Force temporary files to be created in output_dir
         }
 
-        # Ensure the samples file is present
-        samples_path = self.output_dir / "samples.h5"
-        if not samples_path.is_file():
-            raise FileNotFoundError(f"Samples file not found at {samples_path}. "
-                                    "Please run _generate_samples() first.")
+        # Loop over assigned data points
+        for index in range(rank, len(self.assignments), size):
+            # Each assignment is (weights, surface_assignments)
+            assignment = self.assignments[index]
+            weights = np.array(assignment[0])
+            surface_assignments = assignment[1]
+            N_surface = round_preserving_sum(weights * self.num_histories)
+            nonzero_surfaces = [
+                surface for surface in range(4)
+                if surface_assignments[surface] is not None
+            ]
 
-        # We'll open the samples file once for reading
-        with h5py.File(samples_path, 'r') as hf:
-            samples_dataset = hf['samples']
+            # Build the ephemeral source file
+            source_particles = []
+            for surface in nonzero_surfaces:
+                expansion_idx = surface_assignments[surface]  # which row in the big samples array
+                if expansion_idx is None:
+                    continue
+                
+                # Each file "profile_{surface_id}.h5" has shape (num_histories, 3)
+                surface_id = surface_assignments[surface]
+                profile_path = self.output_dir / f"profile_{surface_id}.h5"
+                if not profile_path.is_file():
+                    raise FileNotFoundError(
+                        f"Expected file {profile_path} not found. "
+                        "Make sure generate_samples() completed successfully."
+                    )
+                
+                # Read only as many samples as needed for this surface
+                with h5py.File(profile_path, 'r') as pf:
+                    chunk = pf["samples"][:N_surface[surface], :]
+                
+                # Transform angles for the appropriate surface
+                angle_transform = config.INCIDENT_ANGLE_TRANSFORMATIONS[
+                    assignment[1][surface] % 4
+                ][surface]
 
-            # Loop over assigned data points
-            for index in range(rank, len(self.assignments), size):
-                # Each assignment is (weights, surface_assignments)
-                assignment = self.assignments[index]
-                weights = np.array(assignment[0])
-                surface_assignments = assignment[1]
-                N_surface = round_preserving_sum(weights * self.num_histories)
-                nonzero_surfaces = [
-                    surface for surface in range(4)
-                    if surface_assignments[surface] is not None
+                # Convert sample coordinate from config
+                surface_coord_3d = config.SURFACE_COORD_TO_3D[surface]
+
+                for sample in chunk:
+                    xval, omega_in, E = sample
+                    omega_transformed = angle_transform(omega_in)
+                    p = openmc.SourceParticle(
+                        r=surface_coord_3d(xval),
+                        u=(np.cos(omega_transformed), np.sin(omega_transformed), 0.0),
+                        E=E
+                    )
+                    source_particles.append(p)
+
+            # Write to a temporary source file
+            source_file_path = self.output_dir / f"source{index}.h5"
+            openmc.write_source_file(source_particles, source_file_path)
+
+            # ====== Add Metadata to the Source File ======
+            with h5py.File(self.output_dir / f"source{index}.h5", 'a') as f:
+                f.attrs["nonzero_surfaces"] = np.array(nonzero_surfaces, dtype=np.int32)
+
+            # Run the pincell calculation with this temp source file
+            proc = subprocess.Popen(
+                [
+                    'python', str(self.pincell_path), 
+                    str(source_file_path), 
+                    '--outdir', str(self.output_dir)
+                ],
+                env=env_no_mpi
+            )
+            proc.communicate()
+
+            # The pincell script is expected to produce statepoint.source{index}.h5
+            sp_path = self.output_dir / f"statepoint.source{index}.h5"
+
+            # Now post-process
+            mesh_tally = pp.SurfaceMeshTally(str(sp_path))
+            coefficients = pp.compute_coefficients(mesh_tally, self.I, self.J)
+            coefficients = normalize_outgoing_coefs(
+                coefficients, self.energy_filters, self.I, self.J
+            )
+
+            # Grab the Zernike / keff / power weighting from the statepoint
+            with openmc.StatePoint(sp_path) as sp:
+                df = sp.get_tally(name='zernike').get_pandas_dataframe()
+
+                # Example: gather some placeholders for demonstration
+                # (your real logic to parse tallies might differ)
+                tally_names = [(id, sp.tallies[id].name) for id in sp.tallies.keys()]
+                nonleakage_tally_ids = [
+                    tid for tid, name in tally_names if 'nonleakage' in name
                 ]
+                nonleakage_tallies = np.array([
+                    sp.get_tally(id=tid).mean for tid in nonleakage_tally_ids
+                ])
+                keff = np.sum(np.abs(nonleakage_tallies))
 
-                # Build the ephemeral source file
-                source_particles = []
-                for surface in nonzero_surfaces:
-                    expansion_idx = surface_assignments[surface]  # which row in the big samples array
-                    if expansion_idx is None:
-                        continue
-                    # Load the required samples from the dataset
-                    chunk = samples_dataset[expansion_idx, :N_surface[surface], :]
-                    
-                    # Transform angles for the appropriate surface
-                    angle_transform = config.INCIDENT_ANGLE_TRANSFORMATIONS[
-                        assignment[1][surface] % 4
-                    ][surface]
+                # Example: parse some weighting from tallies with IDs 6..9
+                y_wts = []
+                for tid in range(6, 10):
+                    if tid in sp.tallies:
+                        y_wts.append(sp.get_tally(id=tid).mean[0][0][0])
+                    else:
+                        y_wts.append(0.0)
+                y_wts = np.abs(y_wts)
+                if np.sum(y_wts) > 0:
+                    y_wts /= np.sum(y_wts)
 
-                    # Convert sample coordinate from config
-                    surface_coord_3d = config.SURFACE_COORD_TO_3D[surface]
+            means = df['mean']
+            std_devs = df['std. dev.']
+            filtered_coeffs = [
+                mean if abs(mean) >= std_dev else 0
+                for mean, std_dev in zip(means, std_devs)
+            ]
 
-                    for sample in chunk:
-                        xval, omega_in, E = sample
-                        omega_transformed = angle_transform(omega_in)
-                        p = openmc.SourceParticle(
-                            r=surface_coord_3d(xval),
-                            u=(np.cos(omega_transformed), np.sin(omega_transformed), 0.0),
-                            E=E
-                        )
-                        source_particles.append(p)
+            # Gather input data for this assignment
+            weights = np.array(self.assignments[index][0])
+            surface_indices = self.assignments[index][1]
+            surface_expansions = [self.expansions[index // 4].coefficients[index % 4] 
+                                if index is not None else np.zeros(flux_dim[1:]) 
+                                for index in surface_indices]
+            surface_expansions = np.array(surface_expansions)
 
-                # Write to a temporary source file
-                source_file_path = self.output_dir / f"source{index}.h5"
-                openmc.write_source_file(source_particles, source_file_path)
+            # Append local results
+            local_indices.append(index)
+            local_X_flux.append(surface_expansions)   # or real expansions if you are storing them
+            local_X_wts.append(weights)
+            local_Y_flux.append(coefficients)
+            local_Y_pow.append(filtered_coeffs)
+            local_Y_keff.append(keff)
+            local_Y_wts.append(y_wts)
 
-                # ====== Add Metadata to the Source File ======
-                with h5py.File(self.output_dir / f"source{index}.h5", 'a') as f:
-                    f.attrs["nonzero_surfaces"] = np.array(nonzero_surfaces, dtype=np.int32)
-
-                # Run the pincell calculation with this temp source file
-                proc = subprocess.Popen(
-                    [
-                        'python', str(self.pincell_path), 
-                        str(source_file_path), 
-                        '--outdir', str(self.output_dir)
-                    ],
-                    env=env_no_mpi
-                )
-                proc.communicate()
-
-                # The pincell script is expected to produce statepoint.source{index}.h5
-                sp_path = self.output_dir / f"statepoint.source{index}.h5"
-
-                # Now post-process
-                mesh_tally = pp.SurfaceMeshTally(str(sp_path))
-                coefficients = pp.compute_coefficients(mesh_tally, self.I, self.J)
-                coefficients = normalize_outgoing_coefs(
-                    coefficients, self.energy_filters, self.I, self.J
-                )
-
-                # Grab the Zernike / keff / power weighting from the statepoint
-                with openmc.StatePoint(sp_path) as sp:
-                    df = sp.get_tally(name='zernike').get_pandas_dataframe()
-
-                    # Example: gather some placeholders for demonstration
-                    # (your real logic to parse tallies might differ)
-                    tally_names = [(id, sp.tallies[id].name) for id in sp.tallies.keys()]
-                    nonleakage_tally_ids = [
-                        tid for tid, name in tally_names if 'nonleakage' in name
-                    ]
-                    nonleakage_tallies = np.array([
-                        sp.get_tally(id=tid).mean for tid in nonleakage_tally_ids
-                    ])
-                    keff = np.sum(np.abs(nonleakage_tallies))
-
-                    # Example: parse some weighting from tallies with IDs 6..9
-                    y_wts = []
-                    for tid in range(6, 10):
-                        if tid in sp.tallies:
-                            y_wts.append(sp.get_tally(id=tid).mean[0][0][0])
-                        else:
-                            y_wts.append(0.0)
-                    y_wts = np.abs(y_wts)
-                    if np.sum(y_wts) > 0:
-                        y_wts /= np.sum(y_wts)
-
-                means = df['mean']
-                std_devs = df['std. dev.']
-                filtered_coeffs = [
-                    mean if abs(mean) >= std_dev else 0
-                    for mean, std_dev in zip(means, std_devs)
-                ]
-
-                # Gather input data for this assignment
-                weights = np.array(self.assignments[index][0])
-                surface_indices = self.assignments[index][1]
-                surface_expansions = [self.expansions[index // 4].coefficients[index % 4] 
-                                    if index is not None else np.zeros(flux_dim[1:]) 
-                                    for index in surface_indices]
-                surface_expansions = np.array(surface_expansions)
-
-                # Append local results
-                local_indices.append(index)
-                local_X_flux.append(surface_expansions)   # or real expansions if you are storing them
-                local_X_wts.append(weights)
-                local_Y_flux.append(coefficients)
-                local_Y_pow.append(filtered_coeffs)
-                local_Y_keff.append(keff)
-                local_Y_wts.append(y_wts)
-
-                # Delete temporary source and statepoint files to minimize storage
-                if source_file_path.exists():
-                    source_file_path.unlink()
-                if sp_path.exists():
-                    sp_path.unlink()
+            # Delete temporary source and statepoint files to minimize storage
+            if source_file_path.exists():
+                source_file_path.unlink()
+            if sp_path.exists():
+                sp_path.unlink()
 
         # Save local results to a temporary .npz
         temp_filename = self.output_dir / f"temp_data_rank_{rank}.npz"

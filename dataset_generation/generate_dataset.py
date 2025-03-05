@@ -1,6 +1,9 @@
 from pincell_moment_utils.datagen import DatasetGenerator
 from pathlib import Path
 import argparse
+import numpy as np
+
+np.random.seed(42)
 
 def main():
     parser = argparse.ArgumentParser()

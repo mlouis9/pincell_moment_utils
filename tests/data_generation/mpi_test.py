@@ -1,6 +1,9 @@
 from pincell_moment_utils.datagen import DatasetGenerator, DefaultPincellParameters
 from pathlib import Path
 import argparse
+import numpy as np
+
+np.random.seed(42)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -18,12 +21,12 @@ def main():
     N_w = 9
     pincell_params = DefaultPincellParameters()
     pincell_params.wt_enrichment = 0.2
-    pincell_params.num_particles_per_generation = int(1E+04)
-    generator = DatasetGenerator(num_datapoints, I, J, N_p, N_w, output_dir=Path('./example_data'), burn_in=1000,
+    pincell_params.num_particles_per_generation = int(1E+02)
+    generator = DatasetGenerator(num_datapoints, I, J, N_p, N_w, output_dir=Path('./example_data'), burn_in=100,
                                  default_pincell_parameters=pincell_params)
 
     if args.mode == 'source_file':
-        generator.generate_source_files()
+        generator.generate_samples()
     elif args.mode == 'data':
         generator.generate_data()
     else:
