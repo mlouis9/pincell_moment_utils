@@ -1,0 +1,29 @@
+#!/bin/bash
+#PBS -l select=21:ncpus=48:mpiprocs=48
+#PBS -N source_file_generation
+#PBS -l walltime=36:00:00
+#PBS -j oe
+#PBS -P edu_res
+
+echo "Job started on $(date)"
+START_TIME=$(date +%s)  # Record start time in seconds
+
+cat $PBS_NODEFILE
+
+source ~/.bashrc
+module load mpich
+mamba activate my-env
+export PYTHONPATH=/home/louimatt/projects/pincell_moment_utils/src:$PYTHONPATH
+
+export MV2_USE_ALIGNED_ALLOC=1
+cd $PBS_O_WORKDIR
+
+mpirun --hostfile $PBS_NODEFILE -n 1008 -ppn 48 python generate_dataset.py data
+
+END_TIME=$(date +%s)  # Record end time in seconds
+WALLTIME_USED=$((END_TIME - START_TIME))  # Compute walltime used
+
+echo "Job ended on $(date)"
+echo "Total walltime used: $WALLTIME_USED seconds"  # Print walltime in seconds
+echo "Total walltime used: $(echo "$WALLTIME_USED / 60" | bc) minutes"  # Print in minutes
+echo "Total walltime used: $(echo "$WALLTIME_USED / 3600" | bc) hours"  # Print in hours
