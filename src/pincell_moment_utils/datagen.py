@@ -440,6 +440,7 @@ class DatasetGenerator:
                 mean if abs(mean) >= std_dev else 0
                 for mean, std_dev in zip(means, std_devs)
             ]
+            filtered_coeffs = np.array(filtered_coeffs).reshape(zernike_dim, G)
 
             # Gather input data for this assignment
             weights = np.array(self.assignments[index][0])
@@ -495,7 +496,7 @@ class DatasetGenerator:
             X_wts_array = root.create_array(
                 "X_weights",
                 shape=(self.num_datapoints, 4),
-                chunks=(1, 4),
+                chunks=(self.num_datapoints, 4),
                 dtype='float64'
             )
             Y_flux_array = root.create_array(
@@ -506,20 +507,20 @@ class DatasetGenerator:
             )
             Y_pow_array = root.create_array(
                 "Y_power_coeffs", 
-                shape=(self.num_datapoints, zernike_dim),
-                chunks=(1, zernike_dim),
+                shape=(self.num_datapoints, zernike_dim, G),
+                chunks=(self.num_datapoints, zernike_dim, G),
                 dtype='float64'
             )
             Y_keff_array = root.create_array(
                 "Y_keff", 
                 shape=(self.num_datapoints,),
-                chunks=(1,),
+                chunks=(self.num_datapoints,),
                 dtype='float64'
             )
             Y_wts_array = root.create_array(
                 "Y_weights", 
                 shape=(self.num_datapoints, 4),
-                chunks=(1, 4),
+                chunks=(self.num_datapoints, 4),
                 dtype='float64'
             )
 

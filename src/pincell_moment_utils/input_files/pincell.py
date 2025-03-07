@@ -169,6 +169,15 @@ try:
     surface_filters = [openmc.CellFilter([tally_cell_id]) for tally_cell_id in tally_cell_ids]
     fuel_filter = openmc.CellFilter([fuel])
 
+    # Energy filter for multigroup energy binning
+    # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    # Read in CASMO 70 group structure from h5
+    with h5py.File('$energy_file', 'r') as f:
+        energy_groups = f['energy groups'][:]
+
+    energy_filter = openmc.EnergyFilter(energy_groups)
+
+
     # Zernlike expansion filter
     # ^^^^^^^^^^^^^^^^^^^^^^^^^
     order = $zernlike_order
@@ -178,7 +187,7 @@ try:
     flux_tally_zernike.scores = ['flux']
     flux_tally_zernike.estimator = 'collision'
     zernike_filter = openmc.ZernikeFilter(order=order, x=0.0, y=0.0, r=radius)
-    flux_tally_zernike.filters = [fuel_filter, zernike_filter]
+    flux_tally_zernike.filters = [fuel_filter, zernike_filter, energy_filter]
     tallies.append(flux_tally_zernike)
 
     # Meshes along surfaces
@@ -195,15 +204,7 @@ try:
         mesh.upper_right = upper_rights[surface]  # Extend over the y range
         mesh_filter = openmc.MeshFilter(mesh)
         mesh_filters.append(mesh_filter)
-
-    # Energy filter for multigroup energy binning
-    # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    # Read in CASMO 70 group structure from h5
-    with h5py.File('$energy_file', 'r') as f:
-        energy_groups = f['energy groups'][:]
-
-    energy_filter = openmc.EnergyFilter(energy_groups)
-
+    
     # Filters for angular binning on surfaces
     # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
     Nω = $N_omega
