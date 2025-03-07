@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -l select=21:ncpus=48:mpiprocs=48
-#PBS -N source_file_generation
+#PBS -N dataset_generation
 #PBS -l walltime=36:00:00
 #PBS -j oe
 #PBS -P edu_res

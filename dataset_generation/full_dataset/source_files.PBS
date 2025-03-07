@@ -1,7 +1,7 @@
 #!/bin/bash
 #PBS -l select=21:ncpus=48:mpiprocs=3
-#PBS -N source_file_generation
-#PBS -l walltime=12:00:00
+#PBS -N sample_generation
+#PBS -l walltime=1:00:00
 #PBS -j oe
 #PBS -P edu_res
 
@@ -18,7 +18,7 @@ export PYTHONPATH=/home/louimatt/projects/pincell_moment_utils/src:$PYTHONPATH
 export MV2_USE_ALIGNED_ALLOC=1
 cd $PBS_O_WORKDIR
 
-mpirun --hostfile $PBS_NODEFILE -n 63 -ppn 3 python generate_dataset.py source_file
+mpirun --hostfile $PBS_NODEFILE -n 63 -ppn 3 python generate_dataset.py samples
 
 END_TIME=$(date +%s)  # Record end time in seconds
 WALLTIME_USED=$((END_TIME - START_TIME))  # Compute walltime used

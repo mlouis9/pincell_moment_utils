@@ -484,7 +484,7 @@ class DatasetGenerator:
             store_path = self.output_dir / "dataset.zarr"
             store = zarr.storage.LocalStore(store_path)
             root = zarr.group(store=store, overwrite=True)
-            flux_chunks = (10, 4, self.I, self.J, G, 1)
+            flux_chunks = (1000, 4, self.I, self.J, G, 1)
 
             X_flux_array = root.create_array(
                 "X_flux_coeffs", 

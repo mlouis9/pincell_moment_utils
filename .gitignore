@@ -19,3 +19,6 @@ dist
 
 # Ignore unzipped sampled incident flux datapoints
 incident_flux_*
+
+# Ignore the generated dataset
+dataset.zarr
