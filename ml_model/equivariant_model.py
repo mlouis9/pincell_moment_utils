@@ -200,24 +200,12 @@ class SpatialRotEquivariantUpsample3D(nn.Module):
 
     
 class Encoder(nn.Module):
-    def __init__(self, X_flux, hidden_channels, out_channels, num_layers):
+    def __init__(self, in_channels, hidden_channels, out_channels, num_layers, upsample=True):
         super().__init__()
-        # Move axis to put channels first
-        input = np.moveaxis(X_flux[:, :, :, :, :, :], -1, 2)
-
-        self.B, self.N, self.C, self.H, self.W, self.D = input.shape
-        
-        # Generate symmetric positional channel
-        pos_array = make_3d_position_encodings(self.H, self.W, self.D, self.B)  # NumPy array
-        pos_tensor = torch.from_numpy(pos_array).float()                       # Convert to FloatTensor
-
-        # If it's truly a constant (not trainable), register it as a buffer:
-        self.register_buffer("pos_encodings", pos_tensor)
-
-
-        # Note = C + 1 + 6 (positional encodings)
-        in_channels = self.C + 1 + 6
-        self.conv = SpatialRotEquivariantUpsample3D(in_channels, hidden_channels, out_channels, num_layers=num_layers)
+        if upsample:
+            self.conv = SpatialRotEquivariantUpsample3D(in_channels, hidden_channels, out_channels, num_layers=num_layers)
+        else:
+            self.conv = SymmetricConvNet3D(in_channels, hidden_channels, out_channels, num_layers=num_layers)
 
     def forward(self, X_flux, X_wts):
         """
@@ -225,74 +213,143 @@ class Encoder(nn.Module):
         X_wts : [B, N] or [B, N, ...] per-surface scalars
         """
         outputs = []
-
-        for surface in range(self.N):
+        
+        if isinstance(X_flux, np.ndarray):
+            X_flux = torch.from_numpy(X_flux).float()
+        if isinstance(X_wts, np.ndarray):
+            X_wts = torch.from_numpy(X_wts).float()
+            
+        B, N, H, W, D, C = X_flux.shape
+        # Dynamically compute positional encodings for the current batch size:
+        pos_array = make_3d_position_encodings(H, W, D, B)
+        pos_encodings = torch.from_numpy(pos_array.copy()).float().to(X_flux.device)
+        
+        for surface in range(N):
             # X_flux[:, surface] => shape [B, H, W, D, C]
             # We want [B, C, H, W, D], so do:
             x = X_flux[:, surface].permute(0, 4, 1, 2, 3)  # => [B, C, H, W, D]
-
+        
             # Weights: shape [B], expand to [B,1,H,W,D]
             surface_wts = X_wts[:, surface].view(-1, 1, 1, 1, 1)
-            surface_wts = surface_wts.expand(-1, 1, self.H, self.W, self.D)
-
-            # Also gather pos_encodings for this batch => shape [B, 6, H, W, D]
-            # Already on correct device (thanks to register_buffer) 
-            # just combine along channel dimension:
-            cat_input = torch.cat([x, surface_wts, self.pos_encodings], dim=1)
-
+            surface_wts = surface_wts.expand(-1, 1, H, W, D)
+        
+            # Concatenate along the channel dimension:
+            cat_input = torch.cat([x, surface_wts, pos_encodings], dim=1)
+        
             out = self.conv(cat_input)
             outputs.append(out)
-
-        # Stack across surface dimension => [B, N, out_channels, H', W', D']
+        
+        # Stack across the surface dimension: [B, N, out_channels, H', W', D']
         return torch.stack(outputs, dim=1)
+
 
 
 # ## Define the Decoders
 
 # In[97]:
 
+from pincell_moment_utils import config
+from pincell_moment_utils.datagen import DefaultPincellParameters
+
+def normalize_outgoing_coefs(coefficients, energy_filters, n_spatial_terms, n_angular_terms):
+    """
+    Normalize coefficients per batch and surface.
+    
+    Parameters:
+      coefficients: torch tensor of shape [B, N, I, J, D, 1]
+      energy_filters: list of length N; for each surface, energy_filters[n].bins is a 2D array.
+      n_spatial_terms: int (I)
+      n_angular_terms: int (J)
+      
+    Returns:
+      Normalized coefficients as a torch tensor with the same shape.
+    """
+    # Detach coefficients and convert to numpy.
+    coeff_np = coefficients.detach().cpu().numpy()  # shape [B, N, I, J, D, 1]
+    B, N, I, J, D, _ = coeff_np.shape
+
+    # Get spatial and angular bounds from config as numpy arrays (shape [N, 2]).
+    spatial_bounds = np.array(config.SPATIAL_BOUNDS)         # (N, 2)
+    angular_bounds = np.array(config.OUTGOING_ANGULAR_BOUNDS)  # (N, 2)
+    
+    # Compute per-surface space factors.
+    # For each surface: ((smax - smin) / n_spatial_terms) * ((omax - omin) / n_angular_terms)
+    space_factors = ((spatial_bounds[:, 1] - spatial_bounds[:, 0]) / n_spatial_terms) * \
+                    ((angular_bounds[:, 1] - angular_bounds[:, 0]) / n_angular_terms)  # shape (N,)
+    
+    # Compute energy bin widths for each surface.
+    # Each dE: shape (D,)
+    dE = np.stack([np.diff(efilter.bins, axis=1).flatten() for efilter in energy_filters], axis=0)  # shape (N, D)
+    
+    # Remove the last singleton dimension: shape becomes [B, N, I, J, D]
+    coeffs_no_s = coeff_np[..., 0]
+    
+    # Sum over the spatial dimensions (axes 2 and 3): shape [B, N, D]
+    sum_spatial = coeffs_no_s.sum(axis=(2, 3))
+    
+    # Multiply the per-surface sum by the space factor and energy bin widths (using broadcasting)
+    scaled_sum = sum_spatial * (space_factors[None, :, None] * dE[None, :, :])
+    
+    # Sum over the energy bins (axis 2) to get the flux integral for each batch and surface: shape [B, N]
+    flux_integral = scaled_sum.sum(axis=2)
+    # Avoid division by zero:
+    flux_integral[flux_integral == 0] = 1
+    
+    # Normalize: divide each coefficient (shape [B, N, I, J, D]) by its corresponding flux integral.
+    coeffs_normalized = coeffs_no_s / flux_integral[:, :, None, None, None]
+    
+    # Put the normalized values back into the original coefficients array.
+    coeff_np[..., 0] = coeffs_normalized
+    
+    # Convert back to a torch tensor, preserving device and data type.
+    return torch.from_numpy(coeff_np).to(coefficients.device).type_as(coefficients)
+
+energy_filters = DefaultPincellParameters().get_energy_filters()
 
 class DecodeCoefficients(nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels, num_layers=2):
         super().__init__()
         assert num_layers >= 1, "Must have at least one layer"
-
         layers = []
         current_in = in_channels
-
         for i in range(num_layers):
             is_first = (i == 0)
             is_last = (i == num_layers - 1)
-
-            out_channels = out_channels if is_last else hidden_channels
+            out_ch = out_channels if is_last else hidden_channels
             stride = 2 if is_first else 1
-
-            layers.append(SymmetricConv3D(in_channels=current_in, out_channels=out_channels, stride=stride, transpose=False, padding=1))
-
-            current_in = out_channels
-
+            layers.append(SymmetricConv3D(in_channels=current_in, out_channels=out_ch,
+                                            stride=stride, transpose=False, padding=1))
+            current_in = out_ch
             if not is_last:
                 layers.append(nn.ReLU())
-
         self.feature_extractor = nn.Sequential(*layers)
-        self.image_head = SymmetricConv3D(in_channels=out_channels, out_channels=1, stride=1, transpose=False, padding=1)
-        self.scalar_head = nn.Sequential(nn.AdaptiveAvgPool3d((1, 1, 1)), nn.Flatten(), nn.Linear(out_channels, 1), nn.Sigmoid())
+        self.image_head = SymmetricConv3D(in_channels=out_ch, out_channels=1,
+                                          stride=1, transpose=False, padding=1)
+        self.scalar_head = nn.Sequential(
+            nn.AdaptiveAvgPool3d((1, 1, 1)),
+            nn.Flatten(),
+            nn.Linear(out_ch, 1),
+            nn.Sigmoid()
+        )
+        self.image_activation = nn.Sigmoid()
 
     def forward(self, x):
         # x: [B, N, C, I, J, D]
         B, N, C, I, J, D = x.shape
         x = x.view(B * N, C, I, J, D)
-
-        embedding = self.feature_extractor(x)  # shape: [B*N, hidden, I', J', D']
-        image_out = self.image_head(embedding)  # shape: [B*N, 1, I', J', D']
+        embedding = self.feature_extractor(x)  # [B*N, hidden, I', J', D']
+        image_out = self.image_head(embedding)   # [B*N, 1, I', J', D']
+        image_out = self.image_activation(image_out)  # [B*N, 1, I', J', D']
 
         # Permute for scalar head
         pooled = embedding.permute(0, 1, 4, 2, 3)
-        scalar_out = self.scalar_head(pooled).squeeze(-1)  # shape: [B*N]
+        scalar_out = self.scalar_head(pooled).squeeze(-1)  # [B*N]
 
-        # Now get the actual spatial dims
+        # Now get the actual spatial dimensions and reshape image_out.
         _, _, I_out, J_out, D_out = image_out.shape
-        image_out = image_out.view(B, N, 1, I_out, J_out, D_out)
+        # Reshape to [B, N, I_out, J_out, D_out, 1] to match target shape.
+        image_out = image_out.view(B, N, I_out, J_out, D_out, 1)
+        # image_out = normalize_outgoing_coefs(image_out, energy_filters, I, J)
         scalar_out = scalar_out.view(B, N)
 
         return image_out, scalar_out
@@ -310,7 +367,8 @@ class DecodePinPower(nn.Module):
             nn.ReLU(),
             nn.Conv3d(in_channels=hidden_channels, out_channels=hidden_channels, kernel_size=(3,3,3), padding=1),
             nn.ReLU(),
-            nn.AdaptiveAvgPool3d((1, out_shape[0], out_shape[1]))  # Output shape: (B, C, 1, 15, 8)
+            nn.AdaptiveAvgPool3d((1, out_shape[0], out_shape[1])),  # Output shape: (B, C, 1, 15, 8)
+            nn.Sigmoid()
         )
 
         input_dim = hidden_channels * out_shape[0] * out_shape[1]
@@ -332,7 +390,11 @@ class DecodePinPower(nn.Module):
         out = self.net(x)                          # [B, hidden_channels, 1, 15, 8]
         out = self.final_proj(out).squeeze(1)      # [B, 15*8]
         return out.view(-1, *self.out_shape)       # [B, 15, 8]
-    
+
+
+class DoubleSigmoid(nn.Module):
+    def forward(self, x):
+        return 2 * torch.sigmoid(x)
 
 class DecodeKeff(nn.Module):
     def __init__(self, in_channels=12, hidden_dim=8):
@@ -346,7 +408,7 @@ class DecodeKeff(nn.Module):
             nn.Linear(in_channels, hidden_dim),  
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),         # single scalar 
-            nn.Softplus()
+            DoubleSigmoid()
         )
 
     def forward(self, x_tensor):
@@ -362,7 +424,7 @@ class DecodeKeff(nn.Module):
 
         # Flatten and pass through MLP: (B, 1)
         out = self.fc(x)
-        return out
+        return out.squeeze(1)
 
 
 # ## Define GNN Architecture
@@ -414,58 +476,7 @@ class EquivariantGNN(nn.Module):
 
 # ## Now Test a Forward Pass
 
-# In[112]:
-
-
-import numpy as np
-
-max_samples = 20
-
-encoder = Encoder(X_flux[:max_samples], hidden_channels=8, out_channels=12, num_layers=3)
-
-out1 = encoder.forward(X_flux[:max_samples], X_wts[:max_samples])
-out2 = encoder.forward(np.rot90(X_flux[:max_samples], 2, axes=(2, 3)), X_wts[:max_samples])
-
-gnn = EquivariantGNN(in_channels=12, hidden_channels=12, out_channels=12, num_layers=3, num_cnn_layers=3)
-out1 = gnn.forward(out1)
-out2 = gnn.forward(out2)
-
-# Now decode
-coef_decoder = DecodeCoefficients(in_channels=12, hidden_channels=8, out_channels=1, num_layers=3)
-coefs_1, wts1 = coef_decoder.forward(out1)
-coefs_2, wts2 = coef_decoder.forward(out2)
-
-# Now decode pin power
-pin_decoder = DecodePinPower(in_channels=12, hidden_channels=8, out_shape=(15,8))
-pin_1 = pin_decoder.forward(out1)
-pin_2 = pin_decoder.forward(out2)
-
-# Now decode keff
-keff_decoder = DecodeKeff(in_channels=12, hidden_dim=8)
-keff_1 = keff_decoder.forward(out1)
-keff_2 = keff_decoder.forward(out2)
-
-
-# In[113]:
-
-
-print(wts1[0], wts2[0])
-print(keff_1[0], keff_2[0])
-
-
-# In[101]:
-
-
-import matplotlib.pyplot as plt
-
-energy_idx = 2
-
-# Rotated output
-plt.imshow(np.rot90(out1[0, 0, 0].detach().numpy()[:, :, energy_idx], 2))
-plt.show()
-# Output of rotated input
-plt.imshow(out2[0, 0, 0].detach().numpy()[:, :, energy_idx])
-plt.show()
+# In[112]
 
 
 # ## Define a Full Neural Network Model
@@ -477,22 +488,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class EquivariantModel(nn.Module):
-    def __init__(self, X_flux, 
+    def __init__(self, input_channels=8, 
                  embedding_channels=12, 
                  num_gnn_layers=3, 
                  num_cnn_layers=2, 
                  hidden_gnn_channels=12, 
                  hidden_decoder_channels=8,
                  hidden_encoder_channels=8,
-                 dropout_prob=0.1):
+                 upsample=True,
+                 dropout_prob=0):
         super().__init__()
         
         # Your existing submodules
         self.encoder = Encoder(
-            X_flux[:1], 
+            input_channels, 
             hidden_channels=hidden_encoder_channels, 
             out_channels=embedding_channels, 
-            num_layers=num_cnn_layers
+            num_layers=num_cnn_layers,
+            upsample=upsample
         )
         self.gnn = EquivariantGNN(
             in_channels=embedding_channels, 
@@ -503,7 +516,7 @@ class EquivariantModel(nn.Module):
         )
         
         # Dropout3d will drop entire feature-maps across the channel dimension
-        # self.mc_dropout = nn.Dropout(p=dropout_prob)
+        self.mc_dropout = nn.Dropout(p=dropout_prob)
         
         self.coef_decoder = DecodeCoefficients(
             in_channels=embedding_channels, 
@@ -539,13 +552,14 @@ class EquivariantModel(nn.Module):
 
 
 max_samples = 1
-model = EquivariantModel(X_flux[:max_samples])
-coefs, wts, pin_flux, keff = model.forward(X_flux[:max_samples], X_wts[:max_samples])
-coefs2, wts, pin_flux, keff = model.forward(np.rot90(X_flux[:max_samples], 2, axes=(2,3)), X_wts[:max_samples])
+X1, X2 = torch.tensor(X_flux[:max_samples], dtype=torch.float32), torch.tensor(X_wts[:max_samples], dtype=torch.float32)
 
+model = EquivariantModel()
+coefs, wts, pin_flux, keff = model.forward(X1, X2)
+coefs2, wts, pin_flux, keff = model.forward(np.rot90(X1, 2, axes=(2,3)).copy(), X2)
 
 # In[170]:
-
+import matplotlib.pyplot as plt
 
 plt.imshow(coefs.detach().numpy()[0, 0, 0, :, :, 0])
 
@@ -565,6 +579,11 @@ print(keff, wts)
 # ## Training
 
 # In[143]:
+
+
+# Train test split
+
+# In[144]:
 
 
 from torch.utils.data import Dataset, DataLoader
@@ -601,10 +620,19 @@ class PincellMomentDataset(Dataset):
         return (X_flux_item, X_wts_item), (Y_flux_item, Y_pow_item, Y_keff_item, Y_wts_item)
 
 
-# Train test split
+from sklearn.preprocessing import StandardScaler
+import numpy as np
 
-# In[144]:
+# --- After loading your dataset arrays and before splitting ---
 
+# Suppose X_flux has shape (n_samples, ..., C). For our normalization,
+# we flatten each sample into a 1D vector.
+def normalize_features(X):
+    n_samples = X.shape[0]
+    X_flat = X.reshape(n_samples, -1)  # Flatten each sample
+    scaler = StandardScaler().fit(X_flat)
+    X_norm = scaler.transform(X_flat).reshape(X.shape)
+    return X_norm, scaler
 
 # Suppose you want an 80/20 split
 num_samples = X_flux.shape[0]
@@ -639,24 +667,42 @@ test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False)
 
 
 # Training loop
+import tqdm
 
 # In[175]:
 
 
 # Initialize model and move to GPU if available
+# device = "cpu"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
 model = EquivariantModel(
-    X_flux, 
+    8, 
     embedding_channels=12,
     num_gnn_layers=3,
     num_cnn_layers=2,
     hidden_gnn_channels=12,
     hidden_decoder_channels=8,
     hidden_encoder_channels=8,
-    dropout_prob=0.1
+    upsample=True,
+    dropout_prob=0
 ).to(device)
+
+# Weight initialization
+def init_weights(m):
+    if isinstance(m, nn.Conv3d):
+        nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.Linear):
+        nn.init.kaiming_normal_(m.weight, nonlinearity='linear')
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+
+model.apply(init_weights)
+
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
 # Define optimizer and MSE loss
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -672,8 +718,9 @@ for epoch in range(num_epochs):
     ########################
     model.train()  # Enable dropout and grad
     running_train_loss = 0.0
-    
-    for (X_flux_batch, X_wts_batch), (Y_flux_batch, Y_pow_batch, Y_keff_batch, Y_wts_batch) in train_loader:
+
+    progress_bar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False)
+    for (X_flux_batch, X_wts_batch), (Y_flux_batch, Y_pow_batch, Y_keff_batch, Y_wts_batch) in progress_bar:
         # Move data to GPU
         X_flux_batch = X_flux_batch.to(device)
         X_wts_batch  = X_wts_batch.to(device)
@@ -693,6 +740,9 @@ for epoch in range(num_epochs):
 
         # Combine them (you can weight them differently)
         total_loss = loss_coefs + loss_wts + loss_pin + loss_keff
+
+        print(loss_coefs, loss_pin, loss_wts, loss_keff)
+        print(f"Total loss: {total_loss.item()}")
 
         # Backprop
         optimizer.zero_grad()
@@ -736,4 +786,3 @@ for epoch in range(num_epochs):
 
     print(f"[Epoch {epoch+1}/{num_epochs}] "
           f"Train Loss: {epoch_train_loss:.4f} | Test Loss: {epoch_test_loss:.4f}")
-
