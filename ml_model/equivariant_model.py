@@ -66,7 +66,23 @@ def rotate180_spatial(kernel_3d):
     # kernel_3d shape: (C_out, C_in, kD, kH, kW)
     return torch.rot90(kernel_3d, k=2, dims=[-1, -2])  # rotate over (H, W)
 
-# Reusable 3D symmetric convolution layer
+
+class BatchNorm3dWrapper(nn.Module):
+    def __init__(self, num_features):
+        """
+        A simple wrapper to apply nn.BatchNorm3d on inputs with shape [B, C, H, W, D].
+        Internally, we permute to [B, C, D, H, W], apply BatchNorm3d, then permute back.
+        """
+        super().__init__()
+        self.bn = nn.BatchNorm3d(num_features)
+
+    def forward(self, x):
+        # x: [B, C, H, W, D] -> permute to [B, C, D, H, W]
+        x = x.permute(0, 1, 4, 2, 3)
+        x = self.bn(x)
+        # Permute back to [B, C, H, W, D]
+        return x.permute(0, 1, 3, 4, 2)
+
 class SymmetricConv3D(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=(3,3,3), stride=1, padding=1, bias=True, transpose=False):
         super().__init__()
@@ -84,6 +100,7 @@ class SymmetricConv3D(nn.Module):
     def forward(self, x):
         # Permute (B, C, H, W, D) → (B, C, D, H, W)
         x = x.permute(0, 1, 4, 2, 3)
+        # Enforce symmetry on the filters
         w = 0.5 * (self.weight_raw + rotate180_spatial(self.weight_raw))
 
         if self.transpose:
@@ -91,7 +108,8 @@ class SymmetricConv3D(nn.Module):
         else:
             out = F.conv3d(x, w, bias=self.bias, stride=self.stride, padding=self.padding)
 
-        return out.permute(0, 1, 3, 4, 2)  # (B, C, H, W, D)
+        # Permute back to [B, C, H, W, D]
+        return out.permute(0, 1, 3, 4, 2)
 
 class SymmetricConvNet3D(nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels, num_layers=2):
@@ -102,13 +120,19 @@ class SymmetricConvNet3D(nn.Module):
 
         if num_layers == 1:
             layers.append(SymmetricConv3D(in_channels, out_channels, stride=1, transpose=False, padding=1))
+            layers.append(BatchNorm3dWrapper(out_channels))
         else:
+            # First layer: conv -> norm -> ReLU
             layers.append(SymmetricConv3D(in_channels, hidden_channels, stride=1, transpose=False, padding=1))
+            layers.append(BatchNorm3dWrapper(hidden_channels))
             layers.append(nn.ReLU())
             for _ in range(num_layers - 2):
                 layers.append(SymmetricConv3D(hidden_channels, hidden_channels, stride=1, transpose=False, padding=1))
+                layers.append(BatchNorm3dWrapper(hidden_channels))
                 layers.append(nn.ReLU())
+            # Last layer: conv -> norm (activation can be applied externally if needed)
             layers.append(SymmetricConv3D(hidden_channels, out_channels, stride=1, transpose=False, padding=1))
+            layers.append(BatchNorm3dWrapper(out_channels))
 
         self.net = nn.Sequential(*layers)
 
@@ -123,6 +147,7 @@ class SymmetricConvNet3D(nn.Module):
             return self.net(x)
         else:
             raise ValueError(f"Unexpected input shape {x.shape}")
+
 
 
 # ## Define the Encoder
@@ -184,10 +209,12 @@ class SpatialRotEquivariantUpsample3D(nn.Module):
         else:
             # First layer: upsample
             layers.append(SymmetricConv3D(in_channels, hidden_channels, stride=2, transpose=True, padding=1))
+            layers.append(BatchNorm3dWrapper(hidden_channels))
             layers.append(nn.ReLU())
             # Middle layers (if any): normal conv
             for _ in range(num_layers - 2):
                 layers.append(SymmetricConv3D(hidden_channels, hidden_channels, stride=1, transpose=True, padding=1))
+                layers.append(BatchNorm3dWrapper(hidden_channels))
                 layers.append(nn.ReLU())
             # Final layer: output channels, no activation
             layers.append(SymmetricConv3D(hidden_channels, out_channels, stride=1, transpose=True, padding=1))
@@ -321,6 +348,7 @@ class DecodeCoefficients(nn.Module):
                                             stride=stride, transpose=False, padding=1))
             current_in = out_ch
             if not is_last:
+                layers.append(BatchNorm3dWrapper(hidden_channels))
                 layers.append(nn.ReLU())
         self.feature_extractor = nn.Sequential(*layers)
         self.image_head = SymmetricConv3D(in_channels=out_ch, out_channels=1,
@@ -364,8 +392,10 @@ class DecodePinPower(nn.Module):
         # Combine 4 tensors along channel axis: (B, 4*C, H, W, D)
         self.net = nn.Sequential(
             nn.Conv3d(in_channels=4 * in_channels, out_channels=hidden_channels, kernel_size=(3,3,3), padding=1),
+            BatchNorm3dWrapper(hidden_channels),
             nn.ReLU(),
             nn.Conv3d(in_channels=hidden_channels, out_channels=hidden_channels, kernel_size=(3,3,3), padding=1),
+            BatchNorm3dWrapper(hidden_channels),
             nn.ReLU(),
             nn.AdaptiveAvgPool3d((1, out_shape[0], out_shape[1])),  # Output shape: (B, C, 1, 15, 8)
             nn.Sigmoid()
@@ -437,6 +467,15 @@ class EquivariantGNNLayer(nn.Module):
         super().__init__()
         self.message_fn = SymmetricConvNet3D(in_channels, hidden_channels, out_channels, num_cnn_layers)
         self.update_fn = SymmetricConvNet3D(in_channels + out_channels, hidden_channels, out_channels, num_cnn_layers)
+
+        # Create a residual projection if the input channel dimension doesn't match out_channels.
+        if in_channels != out_channels:
+            self.residual_conv = SymmetricConv3D(
+                in_channels, out_channels, kernel_size=(1, 1, 1),
+                stride=1, padding=0, transpose=False
+            )
+        else:
+            self.residual_conv = nn.Identity()
 
     def forward(self, x):
         # x: [B, N, C, H, W, D]
@@ -686,8 +725,11 @@ model = EquivariantModel(
     hidden_decoder_channels=8,
     hidden_encoder_channels=8,
     upsample=True,
-    dropout_prob=0
+    dropout_prob=0.03
 ).to(device)
+
+num_params = sum(p.numel() for p in model.parameters())
+print(f"Total number of parameters: {num_params}")
 
 # Weight initialization
 def init_weights(m):
@@ -705,7 +747,7 @@ model.apply(init_weights)
 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
 # Define optimizer and MSE loss
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 mse_loss  = nn.MSELoss()
 
 num_epochs = 10
@@ -720,6 +762,7 @@ for epoch in range(num_epochs):
     running_train_loss = 0.0
 
     progress_bar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False)
+    data_idx = 0
     for (X_flux_batch, X_wts_batch), (Y_flux_batch, Y_pow_batch, Y_keff_batch, Y_wts_batch) in progress_bar:
         # Move data to GPU
         X_flux_batch = X_flux_batch.to(device)
@@ -741,8 +784,9 @@ for epoch in range(num_epochs):
         # Combine them (you can weight them differently)
         total_loss = loss_coefs + loss_wts + loss_pin + loss_keff
 
-        print(loss_coefs, loss_pin, loss_wts, loss_keff)
-        print(f"Total loss: {total_loss.item()}")
+        if data_idx % 100 == 0:
+            print(f"Coef loss: {loss_coefs.item()}, Pin loss: {loss_pin.item()}, Weight Loss: {loss_wts.item()}, Keff Loss: {loss_keff.item()}")
+            print(f"Total loss: {total_loss.item()}")
 
         # Backprop
         optimizer.zero_grad()
@@ -751,6 +795,7 @@ for epoch in range(num_epochs):
 
         # Accumulate for epoch average
         running_train_loss += total_loss.item() * X_flux_batch.size(0)
+        data_idx += 1
 
     epoch_train_loss = running_train_loss / len(train_dataset)
     train_losses.append(epoch_train_loss)
