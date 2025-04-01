@@ -9,7 +9,7 @@ ANGULAR_BOUNDS = config.OUTGOING_ANGULAR_BOUNDS
 SPATIAL_BOUNDS = config.SPATIAL_BOUNDS
 
 def plot_expansion(expansion: SurfaceExpansionBase, space_index: int, angle_index: int, energy_index: int, surface: int, 
-                   N_space, N_angular, incident: bool=False):
+                   N_space, N_angular, incident: bool=False, compare_expansion: SurfaceExpansionBase=None, relative_difference=True):
     """Plot the surface flux functional expansion
 
     Parameters
@@ -42,6 +42,11 @@ def plot_expansion(expansion: SurfaceExpansionBase, space_index: int, angle_inde
     E_min = expansion.energy_filters[surface].bins[0][0]
     E_max = expansion.energy_filters[surface].bins[-1][-1]
     expansion_vals = expansion.evaluate_on_grid(surface, (space_vals, angle_vals, energy_vals))
+    if compare_expansion is not None:
+        expansion_vals = np.abs(expansion_vals - compare_expansion.evaluate_on_grid(surface, (space_vals, angle_vals, energy_vals)))
+        if relative_difference:
+            expansion_vals = np.abs(expansion_vals) / np.abs(compare_expansion.evaluate_on_grid(surface, (space_vals, angle_vals, energy_vals)))
+
     vmax = np.max(expansion_vals)
     vmin = np.min(expansion_vals)
     if vmax > 0 and vmin > 0:
