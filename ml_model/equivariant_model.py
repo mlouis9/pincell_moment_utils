@@ -43,13 +43,15 @@ dataset_path = '../dataset_generation/full_dataset/dataset.zarr'
 # Open the dataset in read mode
 root = zarr.open_group(dataset_path, mode='r')
 
+dataset_size = 10000
+
 # Access the arrays
-X_flux = root["X_flux_coeffs"]
-X_wts  = root["X_weights"]
-Y_flux = root["Y_flux_coeffs"]
-Y_pow  = root["Y_power_coeffs"]
-Y_keff  = root["Y_keff"]
-Y_wts = root["Y_weights"]
+X_flux = root["X_flux_coeffs"][:dataset_size]
+X_wts  = root["X_weights"][:dataset_size]
+Y_flux = root["Y_flux_coeffs"][:dataset_size]
+Y_pow  = root["Y_power_coeffs"][:dataset_size]
+Y_keff  = root["Y_keff"][:dataset_size]
+Y_wts = root["Y_weights"][:dataset_size]
 
 
 # ## Define the Equivariant CNN Architecture
@@ -278,58 +280,67 @@ class Encoder(nn.Module):
 from pincell_moment_utils import config
 from pincell_moment_utils.datagen import DefaultPincellParameters
 
-def normalize_outgoing_coefs(coefficients, energy_filters, n_spatial_terms, n_angular_terms):
+def normalize_outgoing_coefs_torch(coefficients, energy_filters, n_spatial_terms, n_angular_terms):
     """
-    Normalize coefficients per batch and surface.
+    Differentiable normalization of coefficients.
     
     Parameters:
-      coefficients: torch tensor of shape [B, N, I, J, D, 1]
+      coefficients: torch.Tensor of shape [B, N, I, J, D, 1]
       energy_filters: list of length N; for each surface, energy_filters[n].bins is a 2D array.
       n_spatial_terms: int (I)
       n_angular_terms: int (J)
       
     Returns:
-      Normalized coefficients as a torch tensor with the same shape.
+      Normalized coefficients as a torch.Tensor with the same shape.
     """
-    # Detach coefficients and convert to numpy.
-    coeff_np = coefficients.detach().cpu().numpy()  # shape [B, N, I, J, D, 1]
-    B, N, I, J, D, _ = coeff_np.shape
+    # Get the shape components.
+    B, N, I, J, D, _ = coefficients.shape
 
-    # Get spatial and angular bounds from config as numpy arrays (shape [N, 2]).
-    spatial_bounds = np.array(config.SPATIAL_BOUNDS)         # (N, 2)
-    angular_bounds = np.array(config.OUTGOING_ANGULAR_BOUNDS)  # (N, 2)
+    # Convert constant configuration values to torch tensors.
+    spatial_bounds = torch.tensor(config.SPATIAL_BOUNDS, dtype=coefficients.dtype, device=coefficients.device)  # shape: [N, 2]
+    angular_bounds = torch.tensor(config.OUTGOING_ANGULAR_BOUNDS, dtype=coefficients.dtype, device=coefficients.device)  # shape: [N, 2]
     
-    # Compute per-surface space factors.
+    # Compute per-surface space factors: shape [N]
     # For each surface: ((smax - smin) / n_spatial_terms) * ((omax - omin) / n_angular_terms)
     space_factors = ((spatial_bounds[:, 1] - spatial_bounds[:, 0]) / n_spatial_terms) * \
-                    ((angular_bounds[:, 1] - angular_bounds[:, 0]) / n_angular_terms)  # shape (N,)
+                    ((angular_bounds[:, 1] - angular_bounds[:, 0]) / n_angular_terms)  # shape: [N]
     
     # Compute energy bin widths for each surface.
     # Each dE: shape (D,)
-    dE = np.stack([np.diff(efilter.bins, axis=1).flatten() for efilter in energy_filters], axis=0)  # shape (N, D)
+    dE_list = []
+    for efilter in energy_filters:
+        # Compute differences along axis=1 and flatten (this is a constant value).
+        dE_np = np.diff(efilter.bins, axis=1).flatten()  # numpy array of shape (D,)
+        dE_tensor = torch.tensor(dE_np, dtype=coefficients.dtype, device=coefficients.device)  # shape: [D]
+        dE_list.append(dE_tensor)
+    # Stack into a [N, D] tensor.
+    dE = torch.stack(dE_list, dim=0)  # shape: [N, D]
     
     # Remove the last singleton dimension: shape becomes [B, N, I, J, D]
-    coeffs_no_s = coeff_np[..., 0]
+    coeffs_no_s = coefficients.squeeze(-1)
     
     # Sum over the spatial dimensions (axes 2 and 3): shape [B, N, D]
-    sum_spatial = coeffs_no_s.sum(axis=(2, 3))
+    sum_spatial = coeffs_no_s.sum(dim=(2, 3))
     
-    # Multiply the per-surface sum by the space factor and energy bin widths (using broadcasting)
-    scaled_sum = sum_spatial * (space_factors[None, :, None] * dE[None, :, :])
+    # Multiply the per-surface sum by the space factor and energy bin widths.
+    # Reshape space_factors to [1, N, 1] and dE to [1, N, D] so that broadcasting works:
+    scaled_sum = sum_spatial * (space_factors.view(1, N, 1) * dE.view(1, N, D))
     
     # Sum over the energy bins (axis 2) to get the flux integral for each batch and surface: shape [B, N]
-    flux_integral = scaled_sum.sum(axis=2)
-    # Avoid division by zero:
-    flux_integral[flux_integral == 0] = 1
+    flux_integral = scaled_sum.sum(dim=2)
     
-    # Normalize: divide each coefficient (shape [B, N, I, J, D]) by its corresponding flux integral.
-    coeffs_normalized = coeffs_no_s / flux_integral[:, :, None, None, None]
+    # Avoid division by zero (adding a small epsilon).
+    flux_integral = flux_integral + 1e-10
     
-    # Put the normalized values back into the original coefficients array.
-    coeff_np[..., 0] = coeffs_normalized
+    # Normalize: divide each coefficient by its corresponding flux integral.
+    # We need to broadcast flux_integral from [B, N] to [B, N, I, J, D].
+    normalized_coeffs = coeffs_no_s / flux_integral.view(B, N, 1, 1, 1)
     
-    # Convert back to a torch tensor, preserving device and data type.
-    return torch.from_numpy(coeff_np).to(coefficients.device).type_as(coefficients)
+    # Restore the last singleton dimension: shape becomes [B, N, I, J, D, 1]
+    normalized_coeffs = normalized_coeffs.unsqueeze(-1)
+    
+    return normalized_coeffs
+
 
 energy_filters = DefaultPincellParameters().get_energy_filters()
 
@@ -377,8 +388,9 @@ class DecodeCoefficients(nn.Module):
         _, _, I_out, J_out, D_out = image_out.shape
         # Reshape to [B, N, I_out, J_out, D_out, 1] to match target shape.
         image_out = image_out.view(B, N, I_out, J_out, D_out, 1)
-        # image_out = normalize_outgoing_coefs(image_out, energy_filters, I, J)
+        # image_out = normalize_outgoing_coefs_torch(image_out, energy_filters, I, J)
         scalar_out = scalar_out.view(B, N)
+        scalar_out = F.softmax(scalar_out, dim=1)  # Ensures that for each batch, sum_{n=1}^{N} weight = 1
 
         return image_out, scalar_out
 
@@ -422,10 +434,6 @@ class DecodePinPower(nn.Module):
         return out.view(-1, *self.out_shape)       # [B, 15, 8]
 
 
-class DoubleSigmoid(nn.Module):
-    def forward(self, x):
-        return 2 * torch.sigmoid(x)
-
 class DecodeKeff(nn.Module):
     def __init__(self, in_channels=12, hidden_dim=8):
         super().__init__()
@@ -438,7 +446,7 @@ class DecodeKeff(nn.Module):
             nn.Linear(in_channels, hidden_dim),  
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),         # single scalar 
-            DoubleSigmoid()
+            nn.Softplus()
         )
 
     def forward(self, x_tensor):
@@ -492,7 +500,9 @@ class EquivariantGNNLayer(nn.Module):
 
         messages = torch.stack(messages, dim=1)  # [B, N, C', H, W, D]
         updated_input = torch.cat([x, messages], dim=2)  # Concat along channels
-        return self.update_fn(updated_input)
+        out = self.update_fn(updated_input)
+        gate = torch.sigmoid(out)
+        return gate * out + (1 - gate) * self.residual_conv(x)
 
 
 class EquivariantGNN(nn.Module):
@@ -662,45 +672,69 @@ class PincellMomentDataset(Dataset):
 from sklearn.preprocessing import StandardScaler
 import numpy as np
 
+def scale_data(data):
+    """
+    Scale a multi-dimensional NumPy array sample-wise.
+    
+    Parameters:
+      data: array-like of shape (n_samples, ...)
+    
+    Returns:
+      data_scaled: array of same shape, scaled sample-wise.
+      scaler: a fitted StandardScaler instance.
+    """
+    data_np = np.asarray(data)  # ensure it's a NumPy array
+    n_samples = data_np.shape[0]
+    # Flatten each sample
+    data_flat = data_np.reshape(n_samples, -1)
+    scaler = StandardScaler()
+    data_scaled_flat = scaler.fit_transform(data_flat)
+    # Reshape back to the original dimensions
+    data_scaled = data_scaled_flat.reshape(data_np.shape)
+    return data_scaled, scaler
+
+# Scale input features
+X_flux_scaled, scaler_X_flux = scale_data(X_flux)
+X_wts_scaled, scaler_X_wts = scale_data(X_wts)
+
+# Scale target outputs
+Y_flux_scaled, scaler_Y_flux = scale_data(Y_flux)
+Y_pow_scaled, scaler_Y_pow = scale_data(Y_pow)
+Y_keff_scaled, scaler_Y_keff = scale_data(Y_keff)
+Y_wts_scaled, scaler_Y_wts = scale_data(Y_wts)
+
 # --- After loading your dataset arrays and before splitting ---
 
-# Suppose X_flux has shape (n_samples, ..., C). For our normalization,
-# we flatten each sample into a 1D vector.
-def normalize_features(X):
-    n_samples = X.shape[0]
-    X_flat = X.reshape(n_samples, -1)  # Flatten each sample
-    scaler = StandardScaler().fit(X_flat)
-    X_norm = scaler.transform(X_flat).reshape(X.shape)
-    return X_norm, scaler
-
 # Suppose you want an 80/20 split
-num_samples = X_flux.shape[0]
+# Suppose you want an 80/20 split
+num_samples = X_flux_scaled.shape[0]
 indices = np.random.permutation(num_samples)
 train_size = int(0.8 * num_samples)
 train_indices = indices[:train_size]
 test_indices  = indices[train_size:]
 
-# Slice arrays accordingly
-X_flux_train = X_flux[train_indices]
-X_wts_train  = X_wts[train_indices]
-Y_flux_train = Y_flux[train_indices]
-Y_pow_train  = Y_pow[train_indices]
-Y_keff_train = Y_keff[train_indices]
-Y_wts_train  = Y_wts[train_indices]
+# Slice arrays accordingly using the scaled data
+X_flux_train = X_flux_scaled[train_indices]
+X_wts_train  = X_wts_scaled[train_indices]
+Y_flux_train = Y_flux_scaled[train_indices]
+Y_pow_train  = Y_pow_scaled[train_indices]
+Y_keff_train = Y_keff_scaled[train_indices]
+Y_wts_train  = Y_wts_scaled[train_indices]
 
-X_flux_test = X_flux[test_indices]
-X_wts_test  = X_wts[test_indices]
-Y_flux_test = Y_flux[test_indices]
-Y_pow_test  = Y_pow[test_indices]
-Y_keff_test = Y_keff[test_indices]
-Y_wts_test  = Y_wts[test_indices]
+X_flux_test = X_flux_scaled[test_indices]
+X_wts_test  = X_wts_scaled[test_indices]
+Y_flux_test = Y_flux_scaled[test_indices]
+Y_pow_test  = Y_pow_scaled[test_indices]
+Y_keff_test = Y_keff_scaled[test_indices]
+Y_wts_test  = Y_wts_scaled[test_indices]
+
 
 # Create PyTorch datasets
 train_dataset = PincellMomentDataset(X_flux_train, X_wts_train, Y_flux_train, Y_pow_train, Y_keff_train, Y_wts_train)
 test_dataset  = PincellMomentDataset(X_flux_test,  X_wts_test,  Y_flux_test,  Y_pow_test,  Y_keff_test,  Y_wts_test)
 
 # Dataloaders
-batch_size = 4  # adjust as needed
+batch_size = 10  # adjust as needed
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False)
 
@@ -718,14 +752,14 @@ print("Using device:", device)
 
 model = EquivariantModel(
     8, 
-    embedding_channels=12,
+    embedding_channels=6,
     num_gnn_layers=3,
-    num_cnn_layers=2,
-    hidden_gnn_channels=12,
-    hidden_decoder_channels=8,
-    hidden_encoder_channels=8,
+    num_cnn_layers=3,
+    hidden_gnn_channels=6,
+    hidden_decoder_channels=4,
+    hidden_encoder_channels=4,
     upsample=True,
-    dropout_prob=0.03
+    dropout_prob=0.05
 ).to(device)
 
 num_params = sum(p.numel() for p in model.parameters())
@@ -747,10 +781,11 @@ model.apply(init_weights)
 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
 # Define optimizer and MSE loss
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
 mse_loss  = nn.MSELoss()
 
-num_epochs = 10
+num_epochs = 4
 train_losses = []
 test_losses = []
 
@@ -831,3 +866,73 @@ for epoch in range(num_epochs):
 
     print(f"[Epoch {epoch+1}/{num_epochs}] "
           f"Train Loss: {epoch_train_loss:.4f} | Test Loss: {epoch_test_loss:.4f}")
+    
+    # Update learning rate
+    scheduler.step()
+
+
+# --- Evaluate on a single test point ---
+model.eval()
+sample_idx = 0  # change this to evaluate a different sample
+
+# Extract the test sample
+x_flux_sample = torch.tensor(X_flux_test[sample_idx:sample_idx+1]).float().to(device)
+x_wts_sample  = torch.tensor(X_wts_test[sample_idx:sample_idx+1]).float().to(device)
+
+# Run through the model
+with torch.no_grad():
+    pred_coefs, pred_wts, pred_pin_flux, pred_keff = model(x_flux_sample, x_wts_sample)
+
+# Move predictions to CPU and numpy
+pred_coefs_np = pred_coefs.cpu().numpy()
+pred_wts_np   = pred_wts.cpu().numpy()
+pred_pin_np   = pred_pin_flux.cpu().numpy()
+pred_keff_np  = pred_keff.cpu().numpy()
+
+# Get ground truth (scaled)
+y_flux_true_scaled = Y_flux_test[sample_idx:sample_idx+1]
+y_wts_true_scaled  = Y_wts_test[sample_idx:sample_idx+1]
+y_pow_true_scaled  = Y_pow_test[sample_idx:sample_idx+1]
+y_keff_true_scaled = Y_keff_test[sample_idx:sample_idx+1]
+
+# Unscale predictions and ground truth
+y_flux_pred_orig = scaler_Y_flux.inverse_transform(pred_coefs_np.reshape(1, -1)).reshape(y_flux_true_scaled.shape)
+y_flux_true_orig = scaler_Y_flux.inverse_transform(y_flux_true_scaled.reshape(1, -1)).reshape(y_flux_true_scaled.shape)
+
+y_wts_pred_orig = scaler_Y_wts.inverse_transform(pred_wts_np.reshape(1, -1)).reshape(y_wts_true_scaled.shape)
+y_wts_true_orig = scaler_Y_wts.inverse_transform(y_wts_true_scaled.reshape(1, -1)).reshape(y_wts_true_scaled.shape)
+
+y_pow_pred_orig = scaler_Y_pow.inverse_transform(pred_pin_np.reshape(1, -1)).reshape(y_pow_true_scaled.shape)
+y_pow_true_orig = scaler_Y_pow.inverse_transform(y_pow_true_scaled.reshape(1, -1)).reshape(y_pow_true_scaled.shape)
+
+y_keff_pred_orig = scaler_Y_keff.inverse_transform(pred_keff_np.reshape(1, -1)).reshape(y_keff_true_scaled.shape)
+y_keff_true_orig = scaler_Y_keff.inverse_transform(y_keff_true_scaled.reshape(1, -1)).reshape(y_keff_true_scaled.shape)
+
+# --- Print comparison ---
+print("=== Single Test Sample Evaluation ===")
+print(f"Predicted keff:  {y_keff_pred_orig.flatten()[0]:.6f}")
+print(f"True keff:       {y_keff_true_orig.flatten()[0]:.6f}")
+
+print(f"Pin power MAE:   {np.mean(np.abs(y_pow_pred_orig - y_pow_true_orig)):.6f}")
+print(f"Weight MAE:      {np.mean(np.abs(y_wts_pred_orig - y_wts_true_orig)):.6f}")
+print(f"Flux coef MAE:   {np.mean(np.abs(y_flux_pred_orig - y_flux_true_orig)):.6f}")
+
+
+torch.save(model.state_dict(), "equivariant_model_final.pt")
+
+import matplotlib.pyplot as plt
+
+# Make sure train_losses and test_losses are already populated
+epochs = range(1, len(train_losses) + 1)
+
+plt.figure(figsize=(8, 5))
+plt.plot(epochs, train_losses, label='Train Loss', marker='o')
+plt.plot(epochs, test_losses, label='Test Loss', marker='s')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training and Test Loss per Epoch')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("loss_curve.png", dpi=300)
+plt.close()
